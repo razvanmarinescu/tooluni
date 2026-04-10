@@ -12,6 +12,10 @@ from lib.dataset import default_dataset_path, load_items, normalize_criteria, pr
 from lib.judge import Judge
 from lib.reporting import append_jsonl, load_jsonl, write_summary_csv, write_summary_markdown
 from lib.runners import AnswerRunner, default_model_specs, default_tiers
+from lib.usage_costs import combine_usage_metrics
+
+
+FIXED_JUDGE_MODEL = "gpt-5.4"
 
 
 def parse_args() -> argparse.Namespace:
@@ -20,12 +24,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-index", type=int, default=1)
     parser.add_argument("--end-index", type=int)
     parser.add_argument("--limit", type=int)
-    parser.add_argument("--models", nargs="+", help="Optional list of model names to run, e.g. gpt-5.4 claude-sonnet-4-6")
+    parser.add_argument("--models", nargs="+", help="Optional list of model names to run, e.g. gpt-5.4 claude-haiku-4-5 claude-opus-4-6 claude-sonnet-4-6")
     parser.add_argument("--tiers", nargs="+", help="Optional list of tiers to run, e.g. tooluniverse")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--judge-only", action="store_true")
     parser.add_argument("--run-name")
-    parser.add_argument("--judge-model", default="gpt-5.4")
+    parser.add_argument("--judge-model", default=FIXED_JUDGE_MODEL, help=f"Ignored. Judge model is pinned to {FIXED_JUDGE_MODEL}.")
     return parser.parse_args()
 
 
@@ -58,6 +62,7 @@ def build_output_paths(root: Path, run_name: str | None) -> dict[str, Path]:
         "run_dir": run_dir,
         "responses": run_dir / "responses.jsonl",
         "judgments": run_dir / "judgments.jsonl",
+        "web_traces": run_dir / "web_traces.jsonl",
         "tool_traces": run_dir / "tool_traces.jsonl",
         "summary_csv": run_dir / "summary.csv",
         "summary_md": run_dir / "summary.md",
@@ -67,6 +72,7 @@ def build_output_paths(root: Path, run_name: str | None) -> dict[str, Path]:
 
 def main() -> None:
     args = parse_args()
+    args.judge_model = FIXED_JUDGE_MODEL
     root = project_root()
     run_started_at = dt.datetime.now(dt.timezone.utc)
     run_started_perf = time.perf_counter()
@@ -149,12 +155,26 @@ def main() -> None:
                         "response_error": result.get("error"),
                         "context": result.get("context"),
                         "raw_response": result.get("raw_response"),
+                        "web_trace_available": bool(result.get("web_trace")),
+                        "web_trace_call_count": len(result.get("web_trace") or []),
+                        "web_trace_file": paths["web_traces"].name if result.get("web_trace") else None,
                         "tool_trace_available": bool(result.get("tool_trace")),
                         "tool_trace_call_count": len(result.get("tool_trace") or []),
                         "tool_trace_file": paths["tool_traces"].name if result.get("tool_trace") else None,
+                        **combine_usage_metrics("answer", result.get("usage_metrics")),
                     }
                     append_jsonl(paths["responses"], response_row)
                     response_rows.append(response_row)
+                    if result.get("web_trace"):
+                        append_jsonl(
+                            paths["web_traces"],
+                            {
+                                **base_row,
+                                "question": question,
+                                "web_trace": result.get("web_trace"),
+                                "pretty_trace": result.get("raw_response", {}).get("pretty_web_trace", ""),
+                            },
+                        )
                     if result.get("tool_trace"):
                         append_jsonl(
                             paths["tool_traces"],
@@ -194,6 +214,7 @@ def main() -> None:
                         judge_started_perf = time.perf_counter()
                         judgment = judge.judge_response(question, criteria, response_row["response_text"])
                         judge_duration_seconds = round(time.perf_counter() - judge_started_perf, 3)
+                        judge_meta = judgment.pop("_meta", {}) if isinstance(judgment, dict) else {}
                         judgment_row = {
                             **base_row,
                             "question": question,
@@ -204,6 +225,19 @@ def main() -> None:
                             "judge_duration_seconds": judge_duration_seconds,
                             "judge_error": None,
                             "judgment": judgment,
+                            **combine_usage_metrics("answer", {
+                                "input_tokens": response_row.get("answer_input_tokens"),
+                                "output_tokens": response_row.get("answer_output_tokens"),
+                                "total_tokens": response_row.get("answer_total_tokens"),
+                                "cached_input_tokens": response_row.get("answer_cached_input_tokens"),
+                                "cache_creation_input_tokens": response_row.get("answer_cache_creation_input_tokens"),
+                                "cache_creation_ephemeral_5m_input_tokens": response_row.get("answer_cache_creation_ephemeral_5m_input_tokens"),
+                                "cache_creation_ephemeral_1h_input_tokens": response_row.get("answer_cache_creation_ephemeral_1h_input_tokens"),
+                                "cache_read_input_tokens": response_row.get("answer_cache_read_input_tokens"),
+                                "estimated_cost_usd": response_row.get("answer_estimated_cost_usd"),
+                            }),
+                            **combine_usage_metrics("judge", judge_meta.get("usage_metrics")),
+                            "judge_model_name": judge_meta.get("judge_model_name", args.judge_model),
                         }
                     except Exception as exc:  # pragma: no cover - depends on external APIs
                         judgment_row = {
@@ -216,14 +250,28 @@ def main() -> None:
                             "judge_duration_seconds": None,
                             "judge_error": str(exc),
                             "judgment": None,
+                            **combine_usage_metrics("answer", {
+                                "input_tokens": response_row.get("answer_input_tokens"),
+                                "output_tokens": response_row.get("answer_output_tokens"),
+                                "total_tokens": response_row.get("answer_total_tokens"),
+                                "cached_input_tokens": response_row.get("answer_cached_input_tokens"),
+                                "cache_creation_input_tokens": response_row.get("answer_cache_creation_input_tokens"),
+                                "cache_creation_ephemeral_5m_input_tokens": response_row.get("answer_cache_creation_ephemeral_5m_input_tokens"),
+                                "cache_creation_ephemeral_1h_input_tokens": response_row.get("answer_cache_creation_ephemeral_1h_input_tokens"),
+                                "cache_read_input_tokens": response_row.get("answer_cache_read_input_tokens"),
+                                "estimated_cost_usd": response_row.get("answer_estimated_cost_usd"),
+                            }),
+                            **combine_usage_metrics("judge", None),
+                            "judge_model_name": args.judge_model,
                         }
 
                 append_jsonl(paths["judgments"], judgment_row)
                 judgment_rows.append(judgment_row)
 
+    all_responses = load_jsonl(paths["responses"])
     all_judgments = load_jsonl(paths["judgments"])
-    write_summary_csv(paths["summary_csv"], all_judgments)
-    write_summary_markdown(paths["summary_md"], all_judgments)
+    write_summary_csv(paths["summary_csv"], all_judgments, all_responses)
+    write_summary_markdown(paths["summary_md"], all_judgments, all_responses)
     run_completed_at = dt.datetime.now(dt.timezone.utc)
     run_duration_seconds = round(time.perf_counter() - run_started_perf, 3)
     meta = json.loads(paths["meta"].read_text(encoding="utf-8"))

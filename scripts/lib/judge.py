@@ -8,6 +8,8 @@ from typing import Any
 from dotenv import load_dotenv
 from openai import OpenAI
 
+from .usage_costs import build_usage_metrics
+
 
 EXPECTED_SCORES = {"met": 1.0, "partial": 0.5, "missed": 0.0, "unclear": 0.25}
 PROHIBITED_SCORES = {"not_violated": 0.0, "violated": 1.0, "unclear": 0.5}
@@ -86,10 +88,17 @@ class Judge:
             ],
             max_output_tokens=2500,
         )
+        raw = response.model_dump(mode="json")
         parsed = extract_json_object(response.output_text)
         if has_structured_rubric:
-            return finalize_structured_judgment(parsed)
-        return finalize_rubric_light_judgment(parsed)
+            judgment = finalize_structured_judgment(parsed)
+        else:
+            judgment = finalize_rubric_light_judgment(parsed)
+        judgment["_meta"] = {
+            "judge_model_name": self.model_name,
+            "usage_metrics": build_usage_metrics("openai", self.model_name, raw),
+        }
+        return judgment
 
 
 def finalize_structured_judgment(data: dict[str, Any]) -> dict[str, Any]:

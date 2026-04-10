@@ -137,6 +137,49 @@ def format_web_context(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def build_web_search_trace(payload: dict[str, Any], injected_text: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "step": 1,
+            "query": payload.get("query"),
+            "error": payload.get("error"),
+            "raw_results": payload.get("results", []),
+            "injected_text": injected_text,
+        }
+    ]
+
+
+def render_pretty_web_trace(trace: list[dict[str, Any]]) -> str:
+    if not trace:
+        return ""
+
+    lines: list[str] = []
+    for event in trace:
+        step = event.get("step", "?")
+        lines.append(f"Step {step}: web search")
+        if event.get("query"):
+            lines.append(f"  Query: {event['query']}")
+        if event.get("error"):
+            lines.append(f"  Error: {event['error']}")
+        results = event.get("raw_results") or []
+        lines.append(f"  Result count: {len(results)}")
+        for index, result in enumerate(results, start=1):
+            title = result.get("title") or ""
+            href = result.get("href") or ""
+            body = result.get("body") or ""
+            lines.append(f"  {index}. {title}")
+            if href:
+                lines.append(f"     URL: {href}")
+            if body:
+                lines.append(f"     Snippet: {body}")
+        injected_text = event.get("injected_text") or ""
+        if injected_text:
+            lines.append("  Injected text:")
+            for line in injected_text.splitlines():
+                lines.append(f"    {line}")
+    return "\n".join(lines)
+
+
 def _normalize_tool_results(data: Any) -> list[dict[str, Any]]:
     if isinstance(data, list):
         return [item for item in data if isinstance(item, dict)]

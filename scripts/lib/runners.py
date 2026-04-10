@@ -11,7 +11,14 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from .context import format_tooluniverse_context, format_web_context, tooluniverse_context, web_search_context
+from .context import (
+    build_web_search_trace,
+    format_tooluniverse_context,
+    format_web_context,
+    render_pretty_web_trace,
+    tooluniverse_context,
+    web_search_context,
+)
 from .tooluniverse_mcp import (
     ANTHROPIC_TOOLUNIVERSE_TOOLS,
     OPENAI_TOOLUNIVERSE_TOOLS,
@@ -19,6 +26,7 @@ from .tooluniverse_mcp import (
     ToolUniverseMCPClient,
     render_pretty_tool_trace,
 )
+from .usage_costs import build_usage_metrics
 
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -30,6 +38,13 @@ DEFAULT_SYSTEM_PROMPT = (
 DEFAULT_OUTPUT_TOKEN_BUDGET = 5000
 RETRY_OUTPUT_TOKEN_BUDGET = 8000
 MAX_TOOLUNIVERSE_TOOL_CALLS = 30
+
+
+class GenerationFailure(RuntimeError):
+    def __init__(self, message: str, *, raw_response: dict[str, Any] | None = None, tool_trace: list[dict[str, Any]] | None = None):
+        super().__init__(message)
+        self.raw_response = raw_response
+        self.tool_trace = tool_trace or []
 
 
 def load_local_env(project_root: Path) -> None:
@@ -48,6 +63,8 @@ class ModelSpec:
 def default_model_specs() -> list[ModelSpec]:
     return [
         ModelSpec(provider="openai", model_name="gpt-5.4", display_name="gpt-5.4"),
+        ModelSpec(provider="anthropic", model_name="claude-haiku-4-5", display_name="claude-haiku-4.5"),
+        ModelSpec(provider="anthropic", model_name="claude-opus-4-6", display_name="claude-opus-4.6"),
         ModelSpec(provider="anthropic", model_name="claude-sonnet-4-6", display_name="claude-sonnet-4.6"),
     ]
 
@@ -94,6 +111,10 @@ class AnswerRunner:
         raise ValueError(f"Unsupported tier: {tier}")
 
     def generate(self, model: ModelSpec, tier: str, question: str) -> dict[str, Any]:
+        context_payload: dict[str, Any] = {"type": tier, "text": None, "raw": None}
+        raw_response: dict[str, Any] | None = None
+        trace: list[dict[str, Any]] = []
+        web_trace: list[dict[str, Any]] = []
         try:
             if tier == "tooluniverse":
                 context_payload = {
@@ -102,21 +123,37 @@ class AnswerRunner:
                     "raw": {"mode": "mcp_tool_calls", "transport": "stdio", "core_tools": [tool["name"] for tool in OPENAI_TOOLUNIVERSE_TOOLS]},
                 }
                 if model.provider == "openai":
-                    text, raw, trace = self._generate_openai_tooluniverse(model.model_name, question)
+                    text, raw_response, trace = self._generate_openai_tooluniverse(model.model_name, question)
                 elif model.provider == "anthropic":
-                    text, raw, trace = self._generate_anthropic_tooluniverse(model.model_name, question)
+                    text, raw_response, trace = self._generate_anthropic_tooluniverse(model.model_name, question)
                 else:
                     raise ValueError(f"Unsupported provider: {model.provider}")
             else:
                 context_payload = self.gather_context(question, tier)
                 user_prompt = build_user_prompt(question, tier, context_payload.get("text"))
-                trace = []
+                if tier == "web_tools":
+                    web_trace = build_web_search_trace(context_payload.get("raw") or {}, context_payload.get("text") or "")
                 if model.provider == "openai":
-                    text, raw = self._generate_openai(model.model_name, user_prompt)
+                    text, raw_response = self._generate_openai(model.model_name, user_prompt)
                 elif model.provider == "anthropic":
-                    text, raw = self._generate_anthropic(model.model_name, user_prompt)
+                    text, raw_response = self._generate_anthropic(model.model_name, user_prompt)
                 else:
                     raise ValueError(f"Unsupported provider: {model.provider}")
+        except GenerationFailure as exc:  # pragma: no cover - depends on external APIs
+            usage_metrics = build_usage_metrics(model.provider, model.model_name, exc.raw_response)
+            return {
+                "provider": model.provider,
+                "model_name": model.model_name,
+                "display_name": model.display_name,
+                "tier": tier,
+                "response_text": None,
+                "error": str(exc),
+                "context": context_payload,
+                "raw_response": exc.raw_response,
+                "tool_trace": exc.tool_trace,
+                "web_trace": web_trace,
+                "usage_metrics": usage_metrics,
+            }
         except Exception as exc:  # pragma: no cover - depends on external APIs
             return {
                 "provider": model.provider,
@@ -128,8 +165,19 @@ class AnswerRunner:
                 "context": context_payload,
                 "raw_response": None,
                 "tool_trace": [],
+                "web_trace": [],
+                "usage_metrics": None,
             }
 
+        if tier == "web_tools":
+            raw_response = {
+                **raw_response,
+                "pretty_web_trace": render_pretty_web_trace(web_trace),
+            }
+        else:
+            web_trace = []
+
+        usage_metrics = build_usage_metrics(model.provider, model.model_name, raw_response)
         return {
             "provider": model.provider,
             "model_name": model.model_name,
@@ -138,8 +186,10 @@ class AnswerRunner:
             "response_text": text,
             "error": None,
             "context": context_payload,
-            "raw_response": raw,
+            "raw_response": raw_response,
             "tool_trace": trace,
+            "web_trace": web_trace,
+            "usage_metrics": usage_metrics,
         }
 
     def _generate_openai(self, model_name: str, user_prompt: str) -> tuple[str, dict[str, Any]]:
@@ -160,7 +210,10 @@ class AnswerRunner:
             if not self._openai_response_incomplete(raw):
                 return last_text, {"attempts": attempts, "final": raw}
 
-        raise RuntimeError("OpenAI response was truncated after retrying with a larger token budget.")
+        raise GenerationFailure(
+            "OpenAI response was truncated after retrying with a larger token budget.",
+            raw_response={"attempts": attempts, "final": attempts[-1]["response"] if attempts else None},
+        )
 
     def _generate_anthropic(self, model_name: str, user_prompt: str) -> tuple[str, dict[str, Any]]:
         attempts: list[dict[str, Any]] = []
@@ -182,7 +235,10 @@ class AnswerRunner:
             if not self._anthropic_response_incomplete(raw):
                 return last_text, {"attempts": attempts, "final": raw}
 
-        raise RuntimeError("Anthropic response was truncated after retrying with a larger token budget.")
+        raise GenerationFailure(
+            "Anthropic response was truncated after retrying with a larger token budget.",
+            raw_response={"attempts": attempts, "final": attempts[-1]["response"] if attempts else None},
+        )
 
     @staticmethod
     def _openai_response_incomplete(raw: dict[str, Any]) -> bool:
@@ -202,8 +258,9 @@ class AnswerRunner:
         trace_events: list[dict[str, Any]] = []
         execute_tool_calls = 0
 
-        async with ToolUniverseMCPClient(self.project_root) as tool_client:
-            response = self.openai_client.responses.create(
+        try:
+            async with ToolUniverseMCPClient(self.project_root) as tool_client:
+                response = self.openai_client.responses.create(
                 model=model_name,
                 input=[
                     {"role": "system", "content": TOOLUNIVERSE_SYSTEM_PROMPT},
@@ -213,58 +270,74 @@ class AnswerRunner:
                 tool_choice="required",
                 max_output_tokens=DEFAULT_OUTPUT_TOKEN_BUDGET,
             )
-            raw_turns.append(response.model_dump(mode="json"))
+                raw_turns.append(response.model_dump(mode="json"))
 
-            while True:
-                current_raw = raw_turns[-1]
-                tool_calls = [item for item in response.output if getattr(item, "type", None) == "function_call"]
-                if tool_calls:
-                    outputs = []
-                    for tool_call in tool_calls:
-                        args = json.loads(tool_call.arguments or "{}")
-                        execution = await tool_client.execute_model_tool(tool_call.name, args)
-                        trace_events.append(execution.trace_event)
-                        if execution.trace_event["mcp_tool_name"] == "execute_tool" and execution.trace_event["ok"]:
-                            execute_tool_calls += 1
-                        outputs.append(
-                            {
-                                "type": "function_call_output",
-                                "call_id": tool_call.call_id,
-                                "output": json.dumps(execution.model_result, ensure_ascii=True),
-                            }
+                while True:
+                    current_raw = raw_turns[-1]
+                    tool_calls = [item for item in response.output if getattr(item, "type", None) == "function_call"]
+                    if tool_calls:
+                        outputs = []
+                        for tool_call in tool_calls:
+                            args = json.loads(tool_call.arguments or "{}")
+                            execution = await tool_client.execute_model_tool(tool_call.name, args)
+                            trace_events.append(execution.trace_event)
+                            if execution.trace_event["mcp_tool_name"] == "execute_tool" and execution.trace_event["ok"]:
+                                execute_tool_calls += 1
+                            outputs.append(
+                                {
+                                    "type": "function_call_output",
+                                    "call_id": tool_call.call_id,
+                                    "output": json.dumps(execution.model_result, ensure_ascii=True),
+                                }
+                            )
+                        if len(trace_events) > MAX_TOOLUNIVERSE_TOOL_CALLS:
+                            raise GenerationFailure(
+                                "Exceeded maximum ToolUniverse tool calls in OpenAI tool loop.",
+                                raw_response={"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)},
+                                tool_trace=trace_events,
+                            )
+                        response = self.openai_client.responses.create(
+                            model=model_name,
+                            previous_response_id=response.id,
+                            input=outputs,
+                            tools=OPENAI_TOOLUNIVERSE_TOOLS,
+                            max_output_tokens=DEFAULT_OUTPUT_TOKEN_BUDGET,
                         )
-                    if len(trace_events) > MAX_TOOLUNIVERSE_TOOL_CALLS:
-                        raise RuntimeError("Exceeded maximum ToolUniverse tool calls in OpenAI tool loop.")
-                    response = self.openai_client.responses.create(
-                        model=model_name,
-                        previous_response_id=response.id,
-                        input=outputs,
-                        tools=OPENAI_TOOLUNIVERSE_TOOLS,
-                        max_output_tokens=DEFAULT_OUTPUT_TOKEN_BUDGET,
-                    )
-                    raw_turns.append(response.model_dump(mode="json"))
-                    continue
+                        raw_turns.append(response.model_dump(mode="json"))
+                        continue
 
-                if execute_tool_calls == 0:
-                    response = self.openai_client.responses.create(
-                        model=model_name,
-                        previous_response_id=response.id,
-                        input=[
-                            {
-                                "role": "user",
-                                "content": "You must use tooluniverse_execute_tool at least once to gather real ToolUniverse data before finalizing your answer.",
-                            }
-                        ],
-                        tools=OPENAI_TOOLUNIVERSE_TOOLS,
-                        tool_choice="required",
-                        max_output_tokens=DEFAULT_OUTPUT_TOKEN_BUDGET,
-                    )
-                    raw_turns.append(response.model_dump(mode="json"))
-                    continue
+                    if execute_tool_calls == 0:
+                        response = self.openai_client.responses.create(
+                            model=model_name,
+                            previous_response_id=response.id,
+                            input=[
+                                {
+                                    "role": "user",
+                                    "content": "You must use tooluniverse_execute_tool at least once to gather real ToolUniverse data before finalizing your answer.",
+                                }
+                            ],
+                            tools=OPENAI_TOOLUNIVERSE_TOOLS,
+                            tool_choice="required",
+                            max_output_tokens=DEFAULT_OUTPUT_TOKEN_BUDGET,
+                        )
+                        raw_turns.append(response.model_dump(mode="json"))
+                        continue
 
-                if self._openai_response_incomplete(current_raw):
-                    raise RuntimeError("OpenAI ToolUniverse answer was truncated.")
-                return response.output_text, {"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)}, trace_events
+                    if self._openai_response_incomplete(current_raw):
+                        raise GenerationFailure(
+                            "OpenAI ToolUniverse answer was truncated.",
+                            raw_response={"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)},
+                            tool_trace=trace_events,
+                        )
+                    return response.output_text, {"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)}, trace_events
+        except GenerationFailure:
+            raise
+        except Exception as exc:
+            raise GenerationFailure(
+                str(exc),
+                raw_response={"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)} if raw_turns else None,
+                tool_trace=trace_events,
+            ) from exc
 
     def _generate_anthropic_tooluniverse(self, model_name: str, question: str) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         return anyio.run(self._generate_anthropic_tooluniverse_async, model_name, question)
@@ -279,9 +352,10 @@ class AnswerRunner:
         forced_execute_reminder_sent = False
         forced_finalize_sent = False
 
-        async with ToolUniverseMCPClient(self.project_root) as tool_client:
-            while True:
-                response = self.anthropic_client.messages.create(
+        try:
+            async with ToolUniverseMCPClient(self.project_root) as tool_client:
+                while True:
+                    response = self.anthropic_client.messages.create(
                     model=model_name,
                     system=TOOLUNIVERSE_SYSTEM_PROMPT,
                     max_tokens=DEFAULT_OUTPUT_TOKEN_BUDGET,
@@ -289,78 +363,94 @@ class AnswerRunner:
                     tools=ANTHROPIC_TOOLUNIVERSE_TOOLS if tools_enabled else None,
                     tool_choice=tool_choice,
                 )
-                current_raw = response.model_dump(mode="json")
-                raw_turns.append(current_raw)
+                    current_raw = response.model_dump(mode="json")
+                    raw_turns.append(current_raw)
 
-                tool_uses = [block for block in response.content if getattr(block, "type", None) == "tool_use"]
-                if tool_uses:
-                    messages.append({"role": "assistant", "content": current_raw["content"]})
-                    tool_results = []
-                    for block in tool_uses:
-                        args = dict(block.input)
-                        execution = await tool_client.execute_model_tool(block.name, args)
-                        trace_events.append(execution.trace_event)
-                        if execution.trace_event["mcp_tool_name"] == "execute_tool" and execution.trace_event["ok"]:
-                            execute_tool_calls += 1
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": json.dumps(execution.model_result, ensure_ascii=True),
-                            }
-                        )
-                    messages.append({"role": "user", "content": tool_results})
+                    tool_uses = [block for block in response.content if getattr(block, "type", None) == "tool_use"]
+                    if tool_uses:
+                        messages.append({"role": "assistant", "content": current_raw["content"]})
+                        tool_results = []
+                        for block in tool_uses:
+                            args = dict(block.input)
+                            execution = await tool_client.execute_model_tool(block.name, args)
+                            trace_events.append(execution.trace_event)
+                            if execution.trace_event["mcp_tool_name"] == "execute_tool" and execution.trace_event["ok"]:
+                                execute_tool_calls += 1
+                            tool_results.append(
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": json.dumps(execution.model_result, ensure_ascii=True),
+                                }
+                            )
+                        messages.append({"role": "user", "content": tool_results})
 
-                    if len(trace_events) >= MAX_TOOLUNIVERSE_TOOL_CALLS and execute_tool_calls > 0:
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": "You already have enough ToolUniverse evidence. Do not call more tools. Write the final answer now.",
-                            }
-                        )
-                        tools_enabled = False
-                        tool_choice = None
-                        forced_finalize_sent = True
+                        if len(trace_events) >= MAX_TOOLUNIVERSE_TOOL_CALLS and execute_tool_calls > 0:
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": "You already have enough ToolUniverse evidence. Do not call more tools. Write the final answer now.",
+                                }
+                            )
+                            tools_enabled = False
+                            tool_choice = None
+                            forced_finalize_sent = True
+                            continue
+
+                        if len(trace_events) >= 12 and execute_tool_calls == 0 and not forced_execute_reminder_sent:
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        "Stop tool discovery. On the next tool step, call tooluniverse_execute_tool exactly once with concrete arguments for a real data source, "
+                                        "for example PubMed_search_articles with a query about elephant TP53, or an NCBI/Ensembl gene lookup for TP53 in elephant. After that, finalize the answer."
+                                    ),
+                                }
+                            )
+                            forced_execute_reminder_sent = True
+                            tool_choice = {"type": "any"}
+                            continue
+
+                        if len(trace_events) > MAX_TOOLUNIVERSE_TOOL_CALLS:
+                            raise GenerationFailure(
+                                "Exceeded maximum ToolUniverse tool calls in Anthropic tool loop.",
+                                raw_response={"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)},
+                                tool_trace=trace_events,
+                            )
+
+                        tool_choice = {"type": "auto"}
                         continue
 
-                    if len(trace_events) >= 12 and execute_tool_calls == 0 and not forced_execute_reminder_sent:
+                    if execute_tool_calls == 0:
+                        messages.append({"role": "assistant", "content": current_raw["content"]})
                         messages.append(
                             {
                                 "role": "user",
-                                "content": (
-                                    "Stop tool discovery. On the next tool step, call tooluniverse_execute_tool exactly once with concrete arguments for a real data source, "
-                                    "for example PubMed_search_articles with a query about elephant TP53, or an NCBI/Ensembl gene lookup for TP53 in elephant. After that, finalize the answer."
-                                ),
+                                "content": "You must use tooluniverse_execute_tool at least once to gather real ToolUniverse data before finalizing your answer.",
                             }
                         )
-                        forced_execute_reminder_sent = True
                         tool_choice = {"type": "any"}
+                        tools_enabled = True
                         continue
 
-                    if len(trace_events) > MAX_TOOLUNIVERSE_TOOL_CALLS:
-                        raise RuntimeError("Exceeded maximum ToolUniverse tool calls in Anthropic tool loop.")
+                    if forced_finalize_sent:
+                        text_parts = [block.text for block in response.content if getattr(block, "type", None) == "text"]
+                        return "".join(text_parts), {"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)}, trace_events
 
-                    tool_choice = {"type": "auto"}
-                    continue
+                    if self._anthropic_response_incomplete(current_raw):
+                        raise GenerationFailure(
+                            "Anthropic ToolUniverse answer was truncated.",
+                            raw_response={"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)},
+                            tool_trace=trace_events,
+                        )
 
-                if execute_tool_calls == 0:
-                    messages.append({"role": "assistant", "content": current_raw["content"]})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": "You must use tooluniverse_execute_tool at least once to gather real ToolUniverse data before finalizing your answer.",
-                        }
-                    )
-                    tool_choice = {"type": "any"}
-                    tools_enabled = True
-                    continue
-
-                if forced_finalize_sent:
                     text_parts = [block.text for block in response.content if getattr(block, "type", None) == "text"]
                     return "".join(text_parts), {"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)}, trace_events
-
-                if self._anthropic_response_incomplete(current_raw):
-                    raise RuntimeError("Anthropic ToolUniverse answer was truncated.")
-
-                text_parts = [block.text for block in response.content if getattr(block, "type", None) == "text"]
-                return "".join(text_parts), {"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)}, trace_events
+        except GenerationFailure:
+            raise
+        except Exception as exc:
+            raise GenerationFailure(
+                str(exc),
+                raw_response={"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)} if raw_turns else None,
+                tool_trace=trace_events,
+            ) from exc
