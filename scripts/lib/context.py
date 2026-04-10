@@ -6,7 +6,10 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from duckduckgo_search import DDGS
+try:
+    from ddgs import DDGS
+except ImportError:  # pragma: no cover - fallback for older environments
+    from duckduckgo_search import DDGS
 
 
 STOPWORDS = {

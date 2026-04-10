@@ -29,7 +29,7 @@ DEFAULT_SYSTEM_PROMPT = (
 
 DEFAULT_OUTPUT_TOKEN_BUDGET = 5000
 RETRY_OUTPUT_TOKEN_BUDGET = 8000
-MAX_TOOLUNIVERSE_TOOL_CALLS = 20
+MAX_TOOLUNIVERSE_TOOL_CALLS = 30
 
 
 def load_local_env(project_root: Path) -> None:
@@ -48,7 +48,7 @@ class ModelSpec:
 def default_model_specs() -> list[ModelSpec]:
     return [
         ModelSpec(provider="openai", model_name="gpt-5.4", display_name="gpt-5.4"),
-        ModelSpec(provider="anthropic", model_name="claude-opus-4-6", display_name="claude-opus-4.6"),
+        ModelSpec(provider="anthropic", model_name="claude-sonnet-4-6", display_name="claude-sonnet-4.6"),
     ]
 
 
@@ -224,7 +224,7 @@ class AnswerRunner:
                         args = json.loads(tool_call.arguments or "{}")
                         execution = await tool_client.execute_model_tool(tool_call.name, args)
                         trace_events.append(execution.trace_event)
-                        if execution.trace_event["mcp_tool_name"] == "execute_tool":
+                        if execution.trace_event["mcp_tool_name"] == "execute_tool" and execution.trace_event["ok"]:
                             execute_tool_calls += 1
                         outputs.append(
                             {
@@ -275,6 +275,9 @@ class AnswerRunner:
         execute_tool_calls = 0
         messages: list[dict[str, Any]] = [{"role": "user", "content": question.strip()}]
         tool_choice: dict[str, Any] | None = {"type": "any"}
+        tools_enabled = True
+        forced_execute_reminder_sent = False
+        forced_finalize_sent = False
 
         async with ToolUniverseMCPClient(self.project_root) as tool_client:
             while True:
@@ -283,7 +286,7 @@ class AnswerRunner:
                     system=TOOLUNIVERSE_SYSTEM_PROMPT,
                     max_tokens=DEFAULT_OUTPUT_TOKEN_BUDGET,
                     messages=messages,
-                    tools=ANTHROPIC_TOOLUNIVERSE_TOOLS,
+                    tools=ANTHROPIC_TOOLUNIVERSE_TOOLS if tools_enabled else None,
                     tool_choice=tool_choice,
                 )
                 current_raw = response.model_dump(mode="json")
@@ -297,7 +300,7 @@ class AnswerRunner:
                         args = dict(block.input)
                         execution = await tool_client.execute_model_tool(block.name, args)
                         trace_events.append(execution.trace_event)
-                        if execution.trace_event["mcp_tool_name"] == "execute_tool":
+                        if execution.trace_event["mcp_tool_name"] == "execute_tool" and execution.trace_event["ok"]:
                             execute_tool_calls += 1
                         tool_results.append(
                             {
@@ -306,9 +309,37 @@ class AnswerRunner:
                                 "content": json.dumps(execution.model_result, ensure_ascii=True),
                             }
                         )
+                    messages.append({"role": "user", "content": tool_results})
+
+                    if len(trace_events) >= MAX_TOOLUNIVERSE_TOOL_CALLS and execute_tool_calls > 0:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": "You already have enough ToolUniverse evidence. Do not call more tools. Write the final answer now.",
+                            }
+                        )
+                        tools_enabled = False
+                        tool_choice = None
+                        forced_finalize_sent = True
+                        continue
+
+                    if len(trace_events) >= 12 and execute_tool_calls == 0 and not forced_execute_reminder_sent:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Stop tool discovery. On the next tool step, call tooluniverse_execute_tool exactly once with concrete arguments for a real data source, "
+                                    "for example PubMed_search_articles with a query about elephant TP53, or an NCBI/Ensembl gene lookup for TP53 in elephant. After that, finalize the answer."
+                                ),
+                            }
+                        )
+                        forced_execute_reminder_sent = True
+                        tool_choice = {"type": "any"}
+                        continue
+
                     if len(trace_events) > MAX_TOOLUNIVERSE_TOOL_CALLS:
                         raise RuntimeError("Exceeded maximum ToolUniverse tool calls in Anthropic tool loop.")
-                    messages.append({"role": "user", "content": tool_results})
+
                     tool_choice = {"type": "auto"}
                     continue
 
@@ -321,7 +352,12 @@ class AnswerRunner:
                         }
                     )
                     tool_choice = {"type": "any"}
+                    tools_enabled = True
                     continue
+
+                if forced_finalize_sent:
+                    text_parts = [block.text for block in response.content if getattr(block, "type", None) == "text"]
+                    return "".join(text_parts), {"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)}, trace_events
 
                 if self._anthropic_response_incomplete(current_raw):
                     raise RuntimeError("Anthropic ToolUniverse answer was truncated.")

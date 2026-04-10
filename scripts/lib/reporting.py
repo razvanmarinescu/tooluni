@@ -8,6 +8,11 @@ from statistics import mean
 from typing import Any
 
 
+def _judgment_payload(row: dict[str, Any]) -> dict[str, Any]:
+    judgment = row.get("judgment")
+    return judgment if isinstance(judgment, dict) else {}
+
+
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -56,6 +61,8 @@ def write_summary_csv(path: Path, judgments: list[dict[str, Any]]) -> None:
         "model_name",
         "tier",
         "has_structured_rubric",
+        "generation_duration_seconds",
+        "judge_duration_seconds",
         "response_error",
         "judge_error",
         "expected_coverage",
@@ -68,7 +75,7 @@ def write_summary_csv(path: Path, judgments: list[dict[str, Any]]) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in judgments:
-            scores = row.get("judgment", {}).get("scores", {})
+            scores = _judgment_payload(row).get("scores", {})
             writer.writerow(
                 {
                     "dataset_index": row.get("dataset_index"),
@@ -78,13 +85,15 @@ def write_summary_csv(path: Path, judgments: list[dict[str, Any]]) -> None:
                     "model_name": row.get("model_name"),
                     "tier": row.get("tier"),
                     "has_structured_rubric": row.get("has_structured_rubric"),
+                    "generation_duration_seconds": row.get("generation_duration_seconds"),
+                    "judge_duration_seconds": row.get("judge_duration_seconds"),
                     "response_error": row.get("response_error"),
                     "judge_error": row.get("judge_error"),
                     "expected_coverage": scores.get("expected_coverage"),
                     "prohibited_rate": scores.get("prohibited_rate"),
                     "final_score": scores.get("final_score"),
                     "average_holistic_score": scores.get("average_holistic_score"),
-                    "summary": row.get("judgment", {}).get("summary", ""),
+                    "summary": _judgment_payload(row).get("summary", ""),
                 }
             )
 
@@ -100,27 +109,52 @@ def write_summary_markdown(path: Path, judgments: list[dict[str, Any]]) -> None:
     else:
         lines.append("## Aggregate")
         lines.append("")
-        lines.append("| Runner | Items | Mean final score | Mean expected coverage | Total prohibited rate |")
-        lines.append("| --- | ---: | ---: | ---: | ---: |")
+        lines.append("| Runner | Items | Mean answer s | Mean judge s | Mean final score | Mean expected coverage | Total prohibited rate |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
         for key in sorted(grouped):
             rows = grouped[key]
-            final_scores = [r.get("judgment", {}).get("scores", {}).get("final_score") for r in rows]
+            generation_durations = [r.get("generation_duration_seconds") for r in rows]
+            generation_durations = [value for value in generation_durations if isinstance(value, (int, float))]
+            judge_durations = [r.get("judge_duration_seconds") for r in rows]
+            judge_durations = [value for value in judge_durations if isinstance(value, (int, float))]
+            final_scores = [_judgment_payload(r).get("scores", {}).get("final_score") for r in rows]
             final_scores = [value for value in final_scores if isinstance(value, (int, float))]
-            expected_coverages = [r.get("judgment", {}).get("scores", {}).get("expected_coverage") for r in rows]
+            expected_coverages = [_judgment_payload(r).get("scores", {}).get("expected_coverage") for r in rows]
             expected_coverages = [value for value in expected_coverages if isinstance(value, (int, float))]
-            prohibited_rates = [r.get("judgment", {}).get("scores", {}).get("prohibited_rate") for r in rows]
+            prohibited_rates = [_judgment_payload(r).get("scores", {}).get("prohibited_rate") for r in rows]
             prohibited_rates = [value for value in prohibited_rates if isinstance(value, (int, float))]
             lines.append(
-                "| {key} | {count} | {final_score} | {expected_coverage} | {prohibited_rate} |".format(
+                "| {key} | {count} | {generation_duration} | {judge_duration} | {final_score} | {expected_coverage} | {prohibited_rate} |".format(
                     key=key,
                     count=len(rows),
+                    generation_duration=f"{mean(generation_durations):.2f}" if generation_durations else "n/a",
+                    judge_duration=f"{mean(judge_durations):.2f}" if judge_durations else "n/a",
                     final_score=f"{mean(final_scores):.2f}" if final_scores else "n/a",
                     expected_coverage=f"{mean(expected_coverages):.3f}" if expected_coverages else "n/a",
                     prohibited_rate=f"{mean(prohibited_rates):.3f}" if prohibited_rates else "n/a",
                 )
             )
 
-        rubric_light = [row for row in judgments if row.get("judgment", {}).get("no_structured_rubric")]
+        item_groups: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        for row in judgments:
+            if isinstance(row.get("dataset_index"), int):
+                item_groups[row["dataset_index"]].append(row)
+
+        lines.extend(["", "## Timing By Item", "", "| Dataset index | Answer time total s | Judge time total s | Completed runners |", "| --- | ---: | ---: | ---: |"])
+        for dataset_index in sorted(item_groups):
+            rows = item_groups[dataset_index]
+            generation_total = sum(
+                value for value in (row.get("generation_duration_seconds") for row in rows) if isinstance(value, (int, float))
+            )
+            judge_total = sum(
+                value for value in (row.get("judge_duration_seconds") for row in rows) if isinstance(value, (int, float))
+            )
+            completed_runners = sum(1 for row in rows if not row.get("response_error"))
+            lines.append(
+                f"| {dataset_index} | {generation_total:.2f} | {judge_total:.2f} | {completed_runners} |"
+            )
+
+        rubric_light = [row for row in judgments if _judgment_payload(row).get("no_structured_rubric")]
         if rubric_light:
             lines.extend(["", "## Rubric-Light Items", "", f"Count: {len(rubric_light)}"])
 

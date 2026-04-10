@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from dataclasses import dataclass
@@ -70,13 +71,14 @@ OPENAI_TOOLUNIVERSE_TOOLS = [
             "type": "object",
             "properties": {
                 "tool_name": {"type": "string", "description": "Exact ToolUniverse tool name to execute."},
-                "arguments_json": {
-                    "type": "string",
-                    "description": "Tool arguments as a JSON string encoding an object, for example '{\"query\":\"TP53 elephant\"}'.",
-                    "default": "{}",
+                "arguments": {
+                    "type": "object",
+                    "description": "Tool arguments as a JSON object. Pass the exact parameters required by the chosen ToolUniverse tool.",
+                    "default": {},
+                    "additionalProperties": True,
                 },
             },
-            "required": ["tool_name"],
+            "required": ["tool_name", "arguments"],
         },
     },
     {
@@ -186,27 +188,35 @@ class ToolUniverseMCPClient:
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._session_context is not None:
-            await self._session_context.__aexit__(exc_type, exc, tb)
-        if self._stdio_context is not None:
-            await self._stdio_context.__aexit__(exc_type, exc, tb)
-        self.session = None
+        try:
+            if self._session_context is not None:
+                with contextlib.suppress(RuntimeError):
+                    await self._session_context.__aexit__(exc_type, exc, tb)
+            if self._stdio_context is not None:
+                with contextlib.suppress(RuntimeError):
+                    await self._stdio_context.__aexit__(exc_type, exc, tb)
+        finally:
+            self.session = None
 
     async def execute_model_tool(self, model_tool_name: str, arguments: dict[str, Any]) -> ToolUniverseExecution:
         if self.session is None:
             raise RuntimeError("ToolUniverse MCP session is not initialized.")
 
         mcp_tool_name = MODEL_TOOL_TO_MCP_TOOL[model_tool_name]
-        result = await self.session.call_tool(mcp_tool_name, arguments)
+        mcp_arguments = self._prepare_mcp_arguments(model_tool_name, arguments)
+        result = await self.session.call_tool(mcp_tool_name, mcp_arguments)
         raw_result = result.model_dump(mode="json")
         normalized = self._normalize_result(raw_result)
         self.step_counter += 1
+        ok = self._is_successful_result(raw_result, normalized)
         trace_event = {
             "step": self.step_counter,
             "display_name": TRACE_DISPLAY_NAME[model_tool_name],
             "model_tool_name": model_tool_name,
             "mcp_tool_name": mcp_tool_name,
-            "arguments": arguments,
+            "arguments": mcp_arguments,
+            "original_model_arguments": arguments,
+            "ok": ok,
             "result": normalized,
             "raw_result": raw_result,
         }
@@ -216,7 +226,7 @@ class ToolUniverseMCPClient:
     def _normalize_result(raw_result: dict[str, Any]) -> Any:
         structured = raw_result.get("structuredContent")
         if structured is not None:
-            return structured
+            return ToolUniverseMCPClient._deep_parse_jsonish(structured)
 
         content = raw_result.get("content") or []
         if len(content) == 1 and content[0].get("type") == "text":
@@ -226,6 +236,60 @@ class ToolUniverseMCPClient:
             except json.JSONDecodeError:
                 return text
         return raw_result
+
+    @staticmethod
+    def _prepare_mcp_arguments(model_tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if model_tool_name != "tooluniverse_execute_tool":
+            return arguments
+
+        if "arguments" in arguments:
+            tool_arguments = arguments["arguments"]
+        elif "arguments_json" in arguments:
+            tool_arguments = arguments["arguments_json"]
+        else:
+            tool_arguments = {
+                key: value
+                for key, value in arguments.items()
+                if key not in {"tool_name", "arguments", "arguments_json"}
+            }
+
+        if isinstance(tool_arguments, str):
+            try:
+                tool_arguments = json.loads(tool_arguments)
+            except json.JSONDecodeError:
+                tool_arguments = {"_raw": tool_arguments}
+
+        if not isinstance(tool_arguments, dict):
+            raise ValueError("tooluniverse_execute_tool arguments must decode to an object.")
+
+        return {
+            "tool_name": arguments.get("tool_name", ""),
+            "arguments": tool_arguments,
+        }
+
+    @staticmethod
+    def _is_successful_result(raw_result: dict[str, Any], normalized: Any) -> bool:
+        if raw_result.get("isError"):
+            return False
+        if isinstance(normalized, dict) and normalized.get("status") == "error":
+            return False
+        return True
+
+    @staticmethod
+    def _deep_parse_jsonish(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: ToolUniverseMCPClient._deep_parse_jsonish(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [ToolUniverseMCPClient._deep_parse_jsonish(item) for item in value]
+        if isinstance(value, str):
+            stripped = value.strip()
+            if stripped and stripped[0] in "[{":
+                try:
+                    parsed = json.loads(stripped)
+                except json.JSONDecodeError:
+                    return value
+                return ToolUniverseMCPClient._deep_parse_jsonish(parsed)
+        return value
 
 
 def render_pretty_tool_trace(trace_events: list[dict[str, Any]]) -> str:
