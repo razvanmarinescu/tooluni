@@ -38,6 +38,7 @@ DEFAULT_SYSTEM_PROMPT = (
 DEFAULT_OUTPUT_TOKEN_BUDGET = 5000
 RETRY_OUTPUT_TOKEN_BUDGET = 8000
 MAX_TOOLUNIVERSE_TOOL_CALLS = 30
+MAX_TOOLUNIVERSE_TRANSIENT_RETRIES = 2
 
 
 class GenerationFailure(RuntimeError):
@@ -45,6 +46,26 @@ class GenerationFailure(RuntimeError):
         super().__init__(message)
         self.raw_response = raw_response
         self.tool_trace = tool_trace or []
+
+
+def _flatten_exception_messages(exc: BaseException) -> list[str]:
+    nested = getattr(exc, "exceptions", None)
+    if nested:
+        messages: list[str] = []
+        for item in nested:
+            messages.extend(_flatten_exception_messages(item))
+        return messages
+    message = str(exc).strip() or exc.__class__.__name__
+    return [f"{exc.__class__.__name__}: {message}"]
+
+
+def _describe_exception(exc: BaseException) -> str:
+    messages = _flatten_exception_messages(exc)
+    unique_messages: list[str] = []
+    for message in messages:
+        if message not in unique_messages:
+            unique_messages.append(message)
+    return " | ".join(unique_messages)
 
 
 def load_local_env(project_root: Path) -> None:
@@ -340,7 +361,31 @@ class AnswerRunner:
             ) from exc
 
     def _generate_anthropic_tooluniverse(self, model_name: str, question: str) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
-        return anyio.run(self._generate_anthropic_tooluniverse_async, model_name, question)
+        last_failure: GenerationFailure | None = None
+        for attempt in range(MAX_TOOLUNIVERSE_TRANSIENT_RETRIES + 1):
+            try:
+                return anyio.run(self._generate_anthropic_tooluniverse_async, model_name, question)
+            except GenerationFailure as exc:
+                last_failure = exc
+                if attempt >= MAX_TOOLUNIVERSE_TRANSIENT_RETRIES or not self._is_retryable_tooluniverse_failure(exc):
+                    raise
+        assert last_failure is not None
+        raise last_failure
+
+    @staticmethod
+    def _is_retryable_tooluniverse_failure(exc: GenerationFailure) -> bool:
+        message = str(exc).lower()
+        retry_markers = [
+            "taskgroup",
+            "brokenresourceerror",
+            "closedresourceerror",
+            "endofstream",
+            "broken pipe",
+            "connection reset",
+            "connection aborted",
+            "streamclosed",
+        ]
+        return any(marker in message for marker in retry_markers)
 
     async def _generate_anthropic_tooluniverse_async(self, model_name: str, question: str) -> tuple[str, dict[str, Any], list[dict[str, Any]]]:
         raw_turns: list[dict[str, Any]] = []
@@ -351,18 +396,23 @@ class AnswerRunner:
         tools_enabled = True
         forced_execute_reminder_sent = False
         forced_finalize_sent = False
+        final_answer_retry_used = False
 
         try:
             async with ToolUniverseMCPClient(self.project_root) as tool_client:
                 while True:
-                    response = self.anthropic_client.messages.create(
-                    model=model_name,
-                    system=TOOLUNIVERSE_SYSTEM_PROMPT,
-                    max_tokens=DEFAULT_OUTPUT_TOKEN_BUDGET,
-                    messages=messages,
-                    tools=ANTHROPIC_TOOLUNIVERSE_TOOLS if tools_enabled else None,
-                    tool_choice=tool_choice,
-                )
+                    max_tokens = RETRY_OUTPUT_TOKEN_BUDGET if (forced_finalize_sent or final_answer_retry_used) else DEFAULT_OUTPUT_TOKEN_BUDGET
+                    request_kwargs: dict[str, Any] = {
+                        "model": model_name,
+                        "system": TOOLUNIVERSE_SYSTEM_PROMPT,
+                        "max_tokens": max_tokens,
+                        "messages": messages,
+                    }
+                    if tools_enabled:
+                        request_kwargs["tools"] = ANTHROPIC_TOOLUNIVERSE_TOOLS
+                        if tool_choice is not None:
+                            request_kwargs["tool_choice"] = tool_choice
+                    response = self.anthropic_client.messages.create(**request_kwargs)
                     current_raw = response.model_dump(mode="json")
                     raw_turns.append(current_raw)
 
@@ -438,8 +488,21 @@ class AnswerRunner:
                         return "".join(text_parts), {"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)}, trace_events
 
                     if self._anthropic_response_incomplete(current_raw):
+                        if not final_answer_retry_used:
+                            messages.append({"role": "assistant", "content": current_raw["content"]})
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": "Continue exactly where you left off and finish the answer. Do not call any more tools.",
+                                }
+                            )
+                            tools_enabled = False
+                            tool_choice = None
+                            forced_finalize_sent = True
+                            final_answer_retry_used = True
+                            continue
                         raise GenerationFailure(
-                            "Anthropic ToolUniverse answer was truncated.",
+                            "Anthropic ToolUniverse answer was truncated after retrying with a larger token budget.",
                             raw_response={"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)},
                             tool_trace=trace_events,
                         )
@@ -450,7 +513,7 @@ class AnswerRunner:
             raise
         except Exception as exc:
             raise GenerationFailure(
-                str(exc),
+                _describe_exception(exc),
                 raw_response={"turns": raw_turns, "pretty_tool_trace": render_pretty_tool_trace(trace_events)} if raw_turns else None,
                 tool_trace=trace_events,
             ) from exc

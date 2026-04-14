@@ -5,10 +5,11 @@ import argparse
 import datetime as dt
 import json
 from pathlib import Path
+import re
 import time
 from typing import Any
 
-from lib.dataset import default_dataset_path, load_items, normalize_criteria, project_root, select_items
+from lib.dataset import default_dataset_path, get_question_text, load_items, normalize_criteria, project_root, select_items
 from lib.judge import Judge
 from lib.reporting import append_jsonl, load_jsonl, write_summary_csv, write_summary_markdown
 from lib.runners import AnswerRunner, default_model_specs, default_tiers
@@ -29,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--judge-only", action="store_true")
     parser.add_argument("--run-name")
+    parser.add_argument("--run-name-suffix", default="", help="Optional suffix for auto-generated run names, e.g. _benchling")
     parser.add_argument("--judge-model", default=FIXED_JUDGE_MODEL, help=f"Ignored. Judge model is pinned to {FIXED_JUDGE_MODEL}.")
     return parser.parse_args()
 
@@ -41,21 +43,24 @@ def judgment_identity(row: dict[str, Any]) -> tuple[Any, ...]:
     return (row.get("dataset_index"), row.get("provider"), row.get("model_name"), row.get("tier"))
 
 
-def next_incremental_run_name(root: Path) -> str:
+def next_incremental_run_name(root: Path, suffix: str = "") -> str:
     runs_dir = root / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
 
     numeric_names = []
     for child in runs_dir.iterdir():
-        if child.is_dir() and child.name.isdigit():
-            numeric_names.append(int(child.name))
+        if not child.is_dir():
+            continue
+        match = re.match(r"^(\d{5})(?:_.+)?$", child.name)
+        if match:
+            numeric_names.append(int(match.group(1)))
 
     next_value = max(numeric_names, default=0) + 1
-    return f"{next_value:05d}"
+    return f"{next_value:05d}{suffix}"
 
 
-def build_output_paths(root: Path, run_name: str | None) -> dict[str, Path]:
-    resolved_run_name = run_name or next_incremental_run_name(root)
+def build_output_paths(root: Path, run_name: str | None, run_name_suffix: str = "") -> dict[str, Path]:
+    resolved_run_name = run_name or next_incremental_run_name(root, suffix=run_name_suffix)
     run_dir = root / "runs" / resolved_run_name
     return {
         "run_name": resolved_run_name,
@@ -78,7 +83,7 @@ def main() -> None:
     run_started_perf = time.perf_counter()
     items = load_items(args.dataset)
     selected_items = select_items(items, start_index=args.start_index, end_index=args.end_index, limit=args.limit)
-    paths = build_output_paths(root, args.run_name)
+    paths = build_output_paths(root, args.run_name, args.run_name_suffix)
     paths["run_dir"].mkdir(parents=True, exist_ok=True)
     paths["meta"].write_text(
         json.dumps(
@@ -121,7 +126,7 @@ def main() -> None:
     judgment_rows: list[dict[str, Any]] = []
 
     for dataset_index, item in selected_items:
-        question = item.get("prompt", "").strip()
+        question = get_question_text(item).strip()
         criteria = normalize_criteria(item)
         for model in model_specs:
             for tier in tiers:
@@ -132,6 +137,7 @@ def main() -> None:
                     "model_name": model.model_name,
                     "display_name": model.display_name,
                     "tier": tier,
+                    "rubric_style": criteria.get("rubric_style"),
                     "has_structured_rubric": criteria["has_structured_rubric"],
                 }
 

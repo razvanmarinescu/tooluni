@@ -190,10 +190,10 @@ class ToolUniverseMCPClient:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         try:
             if self._session_context is not None:
-                with contextlib.suppress(RuntimeError):
+                with contextlib.suppress(Exception):
                     await self._session_context.__aexit__(exc_type, exc, tb)
             if self._stdio_context is not None:
-                with contextlib.suppress(RuntimeError):
+                with contextlib.suppress(Exception):
                     await self._stdio_context.__aexit__(exc_type, exc, tb)
         finally:
             self.session = None
