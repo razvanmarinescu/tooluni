@@ -7,12 +7,37 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
+from .judge import EXPECTED_WEIGHT, PROHIBITED_WEIGHT
 from .usage_costs import build_usage_metrics
+
+
+def _recompute_final_score(scores: dict[str, Any]) -> None:
+    """Recompute `final_score` in place from stored coverage/rate using the
+    currently-configured EXPECTED_WEIGHT / PROHIBITED_WEIGHT. No cap.
+
+    Safe to call repeatedly and on rows from older runs: the previously stored
+    final_score is simply overwritten from the components we already have.
+    """
+    expected_coverage = scores.get("expected_coverage")
+    prohibited_rate = scores.get("prohibited_rate")
+    if not isinstance(expected_coverage, (int, float)):
+        return
+    has_prohibited = isinstance(scores.get("prohibited_max"), (int, float)) and scores.get("prohibited_max") > 0
+    if has_prohibited and isinstance(prohibited_rate, (int, float)):
+        compliance = 1.0 - prohibited_rate
+    else:
+        compliance = 1.0
+    scores["final_score"] = 100.0 * (EXPECTED_WEIGHT * expected_coverage + PROHIBITED_WEIGHT * compliance)
 
 
 def _judgment_payload(row: dict[str, Any]) -> dict[str, Any]:
     judgment = row.get("judgment")
-    return judgment if isinstance(judgment, dict) else {}
+    if not isinstance(judgment, dict):
+        return {}
+    scores = judgment.get("scores")
+    if isinstance(scores, dict):
+        _recompute_final_score(scores)
+    return judgment
 
 
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
@@ -53,8 +78,33 @@ def _runner_key(row: dict[str, Any]) -> tuple[str, str]:
     return (str(row.get("display_name", "")), str(row.get("tier", "")))
 
 
+def _per_question_macro_values(rows: list[dict[str, Any]], score_key: str) -> list[float]:
+    """Group rows by dataset_index, take the mean of the given score within
+    each question, and return the list of per-question means. Used for
+    macro-averaging in the aggregate table.
+    """
+    by_index: dict[Any, list[float]] = defaultdict(list)
+    for row in rows:
+        value = _judgment_payload(row).get("scores", {}).get(score_key)
+        if isinstance(value, (int, float)):
+            by_index[row.get("dataset_index")].append(float(value))
+    return [mean(values) for values in by_index.values() if values]
+
+
 def _row_identity(row: dict[str, Any]) -> tuple[Any, ...]:
     return (row.get("dataset_index"), row.get("provider"), row.get("model_name"), row.get("tier"))
+
+
+def _summary_csv_sort_key(row: dict[str, Any]) -> tuple[Any, ...]:
+    dataset_index = row.get("dataset_index")
+    dataset_sort = dataset_index if isinstance(dataset_index, int) else float("inf")
+    return (
+        dataset_sort,
+        str(row.get("tier") or ""),
+        str(row.get("display_name") or ""),
+        str(row.get("provider") or ""),
+        str(row.get("model_name") or ""),
+    )
 
 
 def _rubric_style(row: dict[str, Any], response_row: dict[str, Any] | None = None) -> str:
@@ -171,7 +221,7 @@ def write_summary_csv(path: Path, judgments: list[dict[str, Any]], responses: li
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        for row in judgments:
+        for row in sorted(judgments, key=_summary_csv_sort_key):
             scores = _judgment_payload(row).get("scores", {})
             response_row = response_index.get(_row_identity(row))
             answer_metrics = _build_answer_metrics(row, response_row)
@@ -237,12 +287,19 @@ def write_summary_markdown(path: Path, judgments: list[dict[str, Any]], response
     else:
         lines.append("## Aggregate")
         lines.append("")
+        lines.append(
+            "Means are **macro-averaged**: each runner's score on a question is the "
+            "mean across all runs of that question, and the reported mean is the average "
+            "of those per-question means. When a runner has a single run per question this "
+            "equals the plain mean."
+        )
+        lines.append("")
         if summary_style == "weighted_positive":
-            lines.append("| Runner | Tier | Items | Mean final score | Mean rubric score | Total input tok | Total output tok | Total tok | Est answer $ | Est judge $ | Est total $ | Mean answer s | Mean judge s |")
-            lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
-        else:
-            lines.append("| Runner | Tier | Items | Mean final score | Mean expected coverage | Mean prohibited rate | Total input tok | Total output tok | Total tok | Est answer $ | Est judge $ | Est total $ | Mean answer s | Mean judge s |")
+            lines.append("| Runner | Tier | Questions | Runs | Mean final score | Mean rubric score | Total input tok | Total output tok | Total tok | Est answer $ | Est judge $ | Est total $ | Mean answer s | Mean judge s |")
             lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+        else:
+            lines.append("| Runner | Tier | Questions | Runs | Mean final score | Mean expected coverage | Mean prohibited rate | Total input tok | Total output tok | Total tok | Est answer $ | Est judge $ | Est total $ | Mean answer s | Mean judge s |")
+            lines.append("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
         for key in sorted(grouped):
             display_name, tier = key
             rows = grouped[key]
@@ -250,14 +307,14 @@ def write_summary_markdown(path: Path, judgments: list[dict[str, Any]], response
             generation_durations = [value for value in generation_durations if isinstance(value, (int, float))]
             judge_durations = [r.get("judge_duration_seconds") for r in rows]
             judge_durations = [value for value in judge_durations if isinstance(value, (int, float))]
-            final_scores = [_judgment_payload(r).get("scores", {}).get("final_score") for r in rows]
-            final_scores = [value for value in final_scores if isinstance(value, (int, float))]
-            expected_coverages = [_judgment_payload(r).get("scores", {}).get("expected_coverage") for r in rows]
-            expected_coverages = [value for value in expected_coverages if isinstance(value, (int, float))]
-            prohibited_rates = [_judgment_payload(r).get("scores", {}).get("prohibited_rate") for r in rows]
-            prohibited_rates = [value for value in prohibited_rates if isinstance(value, (int, float))]
-            rubric_scores = [_judgment_payload(r).get("scores", {}).get("rubric_score") for r in rows]
-            rubric_scores = [value for value in rubric_scores if isinstance(value, (int, float))]
+            # Macro-average: first average each metric within a dataset_index
+            # (across that question's runs), then average the per-question means.
+            # When every question has a single run this degenerates to the plain
+            # mean, so behavior is unchanged for the common case.
+            final_scores = _per_question_macro_values(rows, "final_score")
+            expected_coverages = _per_question_macro_values(rows, "expected_coverage")
+            prohibited_rates = _per_question_macro_values(rows, "prohibited_rate")
+            rubric_scores = _per_question_macro_values(rows, "rubric_score")
             answer_metrics = [_build_answer_metrics(row, response_index.get(_row_identity(row))) for row in rows]
             judge_metrics = [_build_judge_metrics(row) for row in rows]
             total_input_tokens = sum(
@@ -280,12 +337,14 @@ def write_summary_markdown(path: Path, judgments: list[dict[str, Any]], response
             )
             answer_cost = sum(value for metrics in answer_metrics for value in [_metric_number(metrics.get("estimated_cost_usd"))] if value is not None)
             judge_cost = sum(value for metrics in judge_metrics for value in [_metric_number(metrics.get("estimated_cost_usd"))] if value is not None)
+            n_questions = len({r.get("dataset_index") for r in rows if r.get("dataset_index") is not None})
             if summary_style == "weighted_positive":
                 lines.append(
-                    "| {display_name} | {tier} | {count} | {final_score} | {rubric_score} | {total_input_tokens} | {total_output_tokens} | {total_tokens} | {answer_cost} | {judge_cost} | {total_cost} | {generation_duration} | {judge_duration} |".format(
+                    "| {display_name} | {tier} | {questions} | {runs} | {final_score} | {rubric_score} | {total_input_tokens} | {total_output_tokens} | {total_tokens} | {answer_cost} | {judge_cost} | {total_cost} | {generation_duration} | {judge_duration} |".format(
                         display_name=display_name,
                         tier=tier,
-                        count=len(rows),
+                        questions=n_questions,
+                        runs=len(rows),
                         final_score=f"{mean(final_scores):.2f}" if final_scores else "n/a",
                         rubric_score=f"{mean(rubric_scores):.3f}" if rubric_scores else "n/a",
                         total_input_tokens=f"{int(total_input_tokens):,}" if total_input_tokens else "n/a",
@@ -300,10 +359,11 @@ def write_summary_markdown(path: Path, judgments: list[dict[str, Any]], response
                 )
             else:
                 lines.append(
-                    "| {display_name} | {tier} | {count} | {final_score} | {expected_coverage} | {prohibited_rate} | {total_input_tokens} | {total_output_tokens} | {total_tokens} | {answer_cost} | {judge_cost} | {total_cost} | {generation_duration} | {judge_duration} |".format(
+                    "| {display_name} | {tier} | {questions} | {runs} | {final_score} | {expected_coverage} | {prohibited_rate} | {total_input_tokens} | {total_output_tokens} | {total_tokens} | {answer_cost} | {judge_cost} | {total_cost} | {generation_duration} | {judge_duration} |".format(
                         display_name=display_name,
                         tier=tier,
-                        count=len(rows),
+                        questions=n_questions,
+                        runs=len(rows),
                         final_score=f"{mean(final_scores):.2f}" if final_scores else "n/a",
                         expected_coverage=f"{mean(expected_coverages):.3f}" if expected_coverages else "n/a",
                         prohibited_rate=f"{mean(prohibited_rates):.3f}" if prohibited_rates else "n/a",
@@ -416,9 +476,10 @@ def write_summary_markdown(path: Path, judgments: list[dict[str, Any]], response
                     "",
                     "Final score:",
                     "$$",
-                    "\\text{final score} = 100 \\cdot \\left(0.8 \\cdot \\text{expected coverage} + 0.2 \\cdot \\text{prohibited compliance}\\right)",
+                    f"\\text{{final score}} = 100 \\cdot \\left({EXPECTED_WEIGHT:.1f} \\cdot \\text{{expected coverage}} + {PROHIBITED_WEIGHT:.1f} \\cdot \\text{{prohibited compliance}}\\right)",
                     "$$",
-                    "For datasets with prohibited criteria, if $P > 0$, then the final score is capped at $74.0$.",
+                    f"Weights: expected coverage ({EXPECTED_WEIGHT:.1f}) / prohibited compliance ({PROHIBITED_WEIGHT:.1f}). "
+                    "No score cap is applied — prohibited violations are expressed entirely through the weight.",
                 ]
             )
 
@@ -460,19 +521,91 @@ def write_summary_markdown(path: Path, judgments: list[dict[str, Any]], response
             if isinstance(row.get("dataset_index"), int):
                 item_groups[row["dataset_index"]].append(row)
 
-        lines.extend(["", "## Timing By Item", "", "| Dataset index | Answer time total s | Judge time total s | Completed runners |", "| --- | ---: | ---: | ---: |"])
+        lines.extend(["", "## Rubric Scores By Question", ""])
+        lines.append(
+            "One sub-table per dataset question. Each sub-table lists every "
+            "run that was scored for that question and ends with a **Mean** "
+            "row (average across the runs in that question group)."
+        )
+        lines.append("")
+        response_by_key = {_row_identity(r): r for r in responses}
+
+        def _fmt(value: Any, decimals: int) -> str:
+            return f"{value:.{decimals}f}" if isinstance(value, (int, float)) else "n/a"
+
         for dataset_index in sorted(item_groups):
-            rows = item_groups[dataset_index]
-            generation_total = sum(
-                value for value in (row.get("generation_duration_seconds") for row in rows) if isinstance(value, (int, float))
-            )
-            judge_total = sum(
-                value for value in (row.get("judge_duration_seconds") for row in rows) if isinstance(value, (int, float))
-            )
-            completed_runners = sum(1 for row in rows if not row.get("response_error"))
-            lines.append(
-                f"| {dataset_index} | {generation_total:.2f} | {judge_total:.2f} | {completed_runners} |"
-            )
+            item_rows = sorted(item_groups[dataset_index], key=_summary_csv_sort_key)
+            question = ""
+            for row in item_rows:
+                response_row = response_by_key.get(_row_identity(row))
+                if response_row and response_row.get("question"):
+                    question = str(response_row.get("question")).strip()
+                    break
+                if row.get("question"):
+                    question = str(row.get("question")).strip()
+                    break
+            preview = question.replace("\n", " ").replace("|", "\\|")
+            if len(preview) > 140:
+                preview = preview[:137] + "..."
+
+            lines.append(f"### Question {dataset_index}")
+            if preview:
+                lines.append("")
+                lines.append(f"> {preview}")
+            lines.append("")
+            if summary_style == "weighted_positive":
+                lines.append("| Runner | Model | Tier | Final score | Rubric score |")
+                lines.append("| --- | --- | --- | ---: | ---: |")
+                finals: list[float] = []
+                rubric_vals: list[float] = []
+                for row in item_rows:
+                    scores = _judgment_payload(row).get("scores", {})
+                    final_score = scores.get("final_score")
+                    rubric_score = scores.get("rubric_score")
+                    if isinstance(final_score, (int, float)):
+                        finals.append(float(final_score))
+                    if isinstance(rubric_score, (int, float)):
+                        rubric_vals.append(float(rubric_score))
+                    lines.append(
+                        f"| {row.get('display_name') or ''} | {row.get('model_name') or ''} | "
+                        f"{row.get('tier') or ''} | {_fmt(final_score, 2)} | {_fmt(rubric_score, 3)} |"
+                    )
+                lines.append(
+                    "| **Mean** | | | **{final}** | **{rubric}** |".format(
+                        final=_fmt(mean(finals) if finals else None, 2),
+                        rubric=_fmt(mean(rubric_vals) if rubric_vals else None, 3),
+                    )
+                )
+            else:
+                lines.append("| Runner | Model | Tier | Final score | Expected coverage | Prohibited rate |")
+                lines.append("| --- | --- | --- | ---: | ---: | ---: |")
+                finals = []
+                coverages: list[float] = []
+                prohibiteds: list[float] = []
+                for row in item_rows:
+                    scores = _judgment_payload(row).get("scores", {})
+                    final_score = scores.get("final_score")
+                    expected_coverage = scores.get("expected_coverage")
+                    prohibited_rate = scores.get("prohibited_rate")
+                    if isinstance(final_score, (int, float)):
+                        finals.append(float(final_score))
+                    if isinstance(expected_coverage, (int, float)):
+                        coverages.append(float(expected_coverage))
+                    if isinstance(prohibited_rate, (int, float)):
+                        prohibiteds.append(float(prohibited_rate))
+                    lines.append(
+                        f"| {row.get('display_name') or ''} | {row.get('model_name') or ''} | "
+                        f"{row.get('tier') or ''} | {_fmt(final_score, 2)} | "
+                        f"{_fmt(expected_coverage, 3)} | {_fmt(prohibited_rate, 3)} |"
+                    )
+                lines.append(
+                    "| **Mean** | | | **{final}** | **{coverage}** | **{prohibited}** |".format(
+                        final=_fmt(mean(finals) if finals else None, 2),
+                        coverage=_fmt(mean(coverages) if coverages else None, 3),
+                        prohibited=_fmt(mean(prohibiteds) if prohibiteds else None, 3),
+                    )
+                )
+            lines.append("")
 
         rubric_light = [row for row in judgments if _judgment_payload(row).get("no_structured_rubric")]
         if rubric_light:

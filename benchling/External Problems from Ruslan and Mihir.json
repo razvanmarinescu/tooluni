@@ -1,0 +1,92 @@
+{
+  "questions": [
+    {
+      "id": "protocol1-genomic-dna-preparation-screening",
+      "question": "You're adapting the published CRISPR genotyping workflow to screen many 96-well clones faster. If you replace QuickExtract-based gDNA prep and the gDNA normalization step with a crude proteinase K lysate made from a small aliquot of each clone, what other steps in the screening workflow should you change, and why?",
+      "rubric": {
+        "criteria": [
+          {
+            "criterion": "Explains that replacing QuickExtract requires a crude proteinase K lysis workflow with an explicit protease inactivation step before PCR, and correctly gives the reason that residual protease from crude lysate can interfere with PCR enzymes. Any scientifically plausible digestion and heat-inactivation conditions are acceptable.",
+            "weight": 10
+          },
+          {
+            "criterion": "Explains the consequence of removing gDNA normalization: PCR template handling must change from fixed DNA mass input to using a small volume of crude lysate, with reaction size and template amount adjusted within a scientifically plausible range.",
+            "weight": 10
+          },
+          {
+            "criterion": "Describes the downstream effect on genotyping logic: PCR product quality becomes the key checkpoint, so the answer should mention confirming a clean amplicon before restriction digest, mismatch-cleavage assay, or sequencing, and note that quantitative comparisons are less reliable without equalized DNA unless amplicons are made comparable.",
+            "weight": 10
+          },
+          {
+            "criterion": "Notes the clone-handling consequence that only a small fraction of each clone needs to be used for lysis, allowing the rest of the cells to be maintained, replica-plated, or frozen during screening.",
+            "weight": 5
+          }
+        ]
+      }
+    },
+    {
+      "id": "protocol1-post-delivery-cloning-strategy",
+      "question": "You want to adapt the published CRISPR-Cas9 protocol for a suspension cell line by skipping FACS entirely, letting electroporated cells recover for about 72 h, and then isolating clones only by limiting dilution into many 96-well plates rather than by single-cell sorting or the published dilution setup. What other parts of the clonal isolation and downstream screening workflow would you change as a result, and why?",
+      "rubric": {
+        "criteria": [
+          {
+            "criterion": "Explains that abandoning FACS requires replacing the FACS branch with a dilution-cloning workflow based on preparing a single-cell suspension, accurate cell counting, and serial dilution into 96-well plates, rather than just naming 'use dilution instead of FACS.'",
+            "weight": 10
+          },
+          {
+            "criterion": "Explains the consequence of delaying clone isolation to a later post-delivery time point (any scientifically plausible later window, e.g. ~48-72 h or similar): more recovery/editing time after electroporation, but possible loss or underrepresentation of slow-growing or growth-defective edited clones.",
+            "weight": 10
+          },
+          {
+            "criterion": "Describes downstream plate-handling changes caused by probabilistic dilution cloning at altered density: using many plates and/or adjusted low-density plating, checking wells for single-colony origin and excluding mixed wells, allowing about a week or more for outgrowth before DNA prep, and preserving part of each clone for expansion/genotyping.",
+            "weight": 5
+          }
+        ]
+      }
+    },
+    {
+      "id": "protocol1-cell-delivery-model-system",
+      "question": "You want to adapt the published CRISPR-Cas9 protocol from its HEK 293FT/hESC workflows to CH12F3-2 suspension B cells, delivering plasmid DNA by electroporation in ZAP buffer on a Bio-Rad GenePulser Xcell. Beyond changing the transfection step itself, what other stages of the protocol would need to be redesigned, and why do those changes follow from switching both the cell type and the delivery method?",
+      "rubric": {
+        "criteria": [
+          {
+            "criterion": "Explains that switching to CH12F3-2 suspension cells requires replacing the published HEK 293FT/hESC culture and delivery sections with a suspension-cell electroporation workflow, including re-optimizing cell number, DNA amount, buffer, cuvette/pulse conditions, and recovery; exact values are not required if scientifically plausible and tied to the rationale.",
+            "weight": 10
+          },
+          {
+            "criterion": "Describes the downstream impact on post-delivery handling and clonal isolation: no adherent-cell confluency or TrypLE/Accutase-based workflow, recovery after electroporation, and limiting-dilution or equivalent single-cell cloning adapted to suspension growth with revised timing/density.",
+            "weight": 10
+          },
+          {
+            "criterion": "Explains that genotyping/sample preparation must be adapted for suspension clones by pelleting cells and using small-volume direct lysis before PCR, while keeping the published PCR-based screening logic (restriction digest, mismatch-cleavage assay, sequencing) as the readout.",
+            "weight": 5
+          },
+          {
+            "criterion": "Notes that published efficiency benchmarks and kit-specific settings from HEK 293FT/hESC workflows do not directly transfer, so viability/editing efficiency and harvest timing must be re-benchmarked in the new cell type because both delivery method and model system affect outcomes.",
+            "weight": 5
+          }
+        ]
+      }
+    },
+    {
+      "id": "protocol1-includes-plasmidsafe-exonuclease-cleanup",
+      "question": "I want to simplify the published sgRNA-cloning workflow by skipping the PlasmidSafe ATP-dependent DNase treatment after the BbsI/ligation reaction. If I make that change, what other downstream steps in the cloning workflow should I change before and after bacterial transformation, and why?",
+      "rubric": {
+        "criteria": [
+          {
+            "criterion": "Explains that omitting PlasmidSafe requires removing the entire cleanup substep and its associated reagents/incubations, and that transformation should occur directly from the completed ligation reaction rather than from a cleaned product.",
+            "weight": 10
+          },
+          {
+            "criterion": "Correctly reasons that skipping the cleanup leaves more background or unwanted DNA in the transformation, so downstream colony validation should be strengthened (e.g., screen more colonies and/or use colony PCR before miniprep and sequencing).",
+            "weight": 10
+          },
+          {
+            "criterion": "Notes the workflow consequence that the cloning timeline is shortened by eliminating the cleanup/inactivation delay, and accepts any scientifically plausible direct-transformation details (such as using a few microliters of ligation mix rather than a single exact volume).",
+            "weight": 5
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -15,6 +15,8 @@ class Pricing:
 
 
 PRICING_BY_MODEL: dict[str, Pricing] = {
+    "claude-opus-4.7": Pricing(5.0, 25.0, cache_write_5m_per_million=6.25, cache_write_1h_per_million=10.0, cache_hit_per_million=0.50),
+    "claude-opus-4-7": Pricing(5.0, 25.0, cache_write_5m_per_million=6.25, cache_write_1h_per_million=10.0, cache_hit_per_million=0.50),
     "claude-opus-4.6": Pricing(5.0, 25.0, cache_write_5m_per_million=6.25, cache_write_1h_per_million=10.0, cache_hit_per_million=0.50),
     "claude-opus-4-6": Pricing(5.0, 25.0, cache_write_5m_per_million=6.25, cache_write_1h_per_million=10.0, cache_hit_per_million=0.50),
     "claude-opus-4.5": Pricing(5.0, 25.0, cache_write_5m_per_million=6.25, cache_write_1h_per_million=10.0, cache_hit_per_million=0.50),

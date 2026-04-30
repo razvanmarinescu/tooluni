@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Protocol Problems Viewer (External)</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1117; color: #e1e4e8; line-height: 1.5; }
+
+  .upload-zone {
+    max-width: 600px; margin: 80px auto; padding: 48px; border: 2px dashed #30363d;
+    border-radius: 12px; text-align: center; cursor: pointer; transition: border-color 0.2s;
+  }
+  .upload-zone:hover, .upload-zone.dragover { border-color: #58a6ff; }
+  .upload-zone h1 { font-size: 20px; margin-bottom: 8px; }
+  .upload-zone p { color: #8b949e; font-size: 14px; }
+  .upload-zone input { display: none; }
+
+  .container { max-width: 900px; margin: 0 auto; padding: 24px; }
+
+  .header {
+    text-align: center; margin-bottom: 32px; padding-bottom: 20px; border-bottom: 1px solid #30363d;
+  }
+  .header h1 { font-size: 24px; margin-bottom: 8px; }
+  .header .count { font-size: 14px; color: #8b949e; }
+
+  .question-card {
+    background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+    margin-bottom: 24px; padding: 24px;
+  }
+
+  .question-id {
+    font-size: 13px; color: #8b949e; font-family: monospace; margin-bottom: 12px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .copy-btn {
+    background: none; border: 1px solid #30363d; border-radius: 4px; color: #8b949e;
+    cursor: pointer; padding: 1px 5px; font-size: 11px; line-height: 1.2;
+  }
+  .copy-btn:hover { background: #30363d; color: #e1e4e8; }
+
+  .question-text {
+    font-size: 16px; line-height: 1.6; color: #c9d1d9; margin-bottom: 20px;
+    padding: 16px; background: #1c2129; border-radius: 8px;
+  }
+
+  .section-title {
+    font-size: 13px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px;
+    margin-bottom: 12px; margin-top: 8px;
+  }
+
+  .rubric-table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  .rubric-table th {
+    text-align: left; color: #8b949e; font-weight: 500; padding: 10px 12px;
+    border-bottom: 1px solid #30363d; background: #0d1117;
+  }
+  .rubric-table td { padding: 12px; border-bottom: 1px solid #21262d; vertical-align: top; }
+  .rubric-table tr:last-child td { border-bottom: none; }
+  .weight-badge {
+    background: #1b2d3d; color: #58a6ff; padding: 3px 10px; border-radius: 8px;
+    font-size: 12px; font-weight: 600; display: inline-block;
+  }
+</style>
+</head>
+<body>
+
+<div class="upload-zone" id="uploadZone">
+  <h1>📁 Drop problems_external.json</h1>
+  <p>or click to browse</p>
+  <input type="file" id="fileInput" accept=".json">
+</div>
+
+<div class="container" id="container" style="display: none;"></div>
+
+<script>
+const uploadZone = document.getElementById('uploadZone');
+const fileInput = document.getElementById('fileInput');
+const container = document.getElementById('container');
+
+uploadZone.addEventListener('click', () => fileInput.click());
+uploadZone.addEventListener('dragover', e => {
+  e.preventDefault();
+  uploadZone.classList.add('dragover');
+});
+uploadZone.addEventListener('dragleave', () => uploadZone.classList.remove('dragover'));
+uploadZone.addEventListener('drop', e => {
+  e.preventDefault();
+  uploadZone.classList.remove('dragover');
+  if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => {
+  if (e.target.files[0]) handleFile(e.target.files[0]);
+});
+
+function handleFile(file) {
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const data = JSON.parse(e.target.result);
+      renderProblems(data);
+    } catch (err) {
+      alert('Error parsing JSON: ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+function renderProblems(data) {
+  uploadZone.style.display = 'none';
+  container.style.display = 'block';
+
+  const questions = data.questions || [];
+
+  container.innerHTML = `
+    <div class="header">
+      <h1>Protocol Questions</h1>
+      <div class="count">${questions.length} question${questions.length === 1 ? '' : 's'}</div>
+    </div>
+    ${questions.map(q => renderQuestion(q)).join('')}
+  `;
+
+  // Attach copy button handlers
+  document.querySelectorAll('.copy-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      navigator.clipboard.writeText(btn.dataset.copy);
+      const orig = btn.textContent;
+      btn.textContent = '✓';
+      setTimeout(() => btn.textContent = orig, 1000);
+    });
+  });
+}
+
+function renderQuestion(q) {
+  const criteria = q.rubric?.criteria || [];
+
+  return `
+    <div class="question-card">
+      <div class="question-id">
+        ${escapeHtml(q.id)}
+        <button class="copy-btn" data-copy="${escapeHtml(q.id)}">copy</button>
+      </div>
+
+      <div class="question-text">${escapeHtml(q.question)}</div>
+
+      <div class="section-title">Rubric</div>
+      <table class="rubric-table">
+        <thead>
+          <tr>
+            <th style="width: 80px;">Weight</th>
+            <th>Criterion</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${criteria.map(c => `
+            <tr>
+              <td><span class="weight-badge">${c.weight}</span></td>
+              <td>${escapeHtml(c.criterion)}</td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+</script>
+
+</body>
+</html>

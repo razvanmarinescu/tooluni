@@ -5,15 +5,24 @@ import os
 from pathlib import Path
 from typing import Any
 
+from anthropic import Anthropic
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import BadRequestError, OpenAI
 
 from .dataset import infer_rubric_style
 from .usage_costs import build_usage_metrics
 
 
+FALLBACK_JUDGE_MODEL = "claude-sonnet-4-6"
+
+
 EXPECTED_SCORES = {"met": 1.0, "partial": 0.5, "missed": 0.0, "unclear": 0.25}
 PROHIBITED_SCORES = {"not_violated": 0.0, "violated": 1.0, "unclear": 0.5}
+
+# Weights applied to expected coverage and prohibited compliance when
+# combining them into the final 0-100 score. Must sum to 1.0.
+EXPECTED_WEIGHT = 0.6
+PROHIBITED_WEIGHT = 0.4
 
 
 def load_local_env(project_root: Path) -> None:
@@ -70,10 +79,18 @@ def extract_json_object(text: str) -> dict[str, Any]:
 
 
 class Judge:
-    def __init__(self, project_root: Path, model_name: str = "gpt-5.4"):
+    def __init__(self, project_root: Path, model_name: str = "gpt-5.4", fallback_model_name: str | None = FALLBACK_JUDGE_MODEL):
         load_local_env(project_root)
         self.client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
         self.model_name = model_name
+        self.fallback_model_name = fallback_model_name
+        self._anthropic_client: Anthropic | None = None
+
+    @property
+    def anthropic_client(self) -> Anthropic:
+        if self._anthropic_client is None:
+            self._anthropic_client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+        return self._anthropic_client
 
     def judge_response(self, question: str, criteria: dict[str, Any], response_text: str) -> dict[str, Any]:
         has_structured_rubric = bool(criteria.get("expected") or criteria.get("prohibited"))
@@ -83,16 +100,26 @@ class Judge:
             if has_structured_rubric
             else build_rubric_light_prompt(question, response_text)
         )
-        response = self.client.responses.create(
-            model=self.model_name,
-            input=[
-                {"role": "system", "content": "Return strict JSON only."},
-                {"role": "user", "content": prompt},
-            ],
-            max_output_tokens=2500,
-        )
-        raw = response.model_dump(mode="json")
-        parsed = extract_json_object(response.output_text)
+        provider = "openai"
+        judge_model_name = self.model_name
+        try:
+            response = self.client.responses.create(
+                model=self.model_name,
+                input=[
+                    {"role": "system", "content": "Return strict JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_output_tokens=2500,
+            )
+            raw = response.model_dump(mode="json")
+            output_text = response.output_text
+        except BadRequestError as exc:
+            if self.fallback_model_name is None or not _is_safety_refusal(exc):
+                raise
+            provider = "anthropic"
+            judge_model_name = self.fallback_model_name
+            output_text, raw = self._call_anthropic_fallback(prompt)
+        parsed = extract_json_object(output_text)
         if has_structured_rubric:
             if rubric_style == "weighted_positive":
                 judgment = finalize_weighted_positive_judgment(parsed, criteria)
@@ -102,10 +129,26 @@ class Judge:
             judgment = finalize_rubric_light_judgment(parsed)
         judgment["rubric_style"] = rubric_style
         judgment["_meta"] = {
-            "judge_model_name": self.model_name,
-            "usage_metrics": build_usage_metrics("openai", self.model_name, raw),
+            "judge_model_name": judge_model_name,
+            "usage_metrics": build_usage_metrics(provider, judge_model_name, raw),
         }
         return judgment
+
+    def _call_anthropic_fallback(self, prompt: str) -> tuple[str, dict[str, Any]]:
+        response = self.anthropic_client.messages.create(
+            model=self.fallback_model_name,
+            system="Return strict JSON only.",
+            max_tokens=2500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.model_dump(mode="json")
+        text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
+        return text, raw
+
+
+def _is_safety_refusal(exc: BadRequestError) -> bool:
+    message = str(exc).lower()
+    return "safety" in message or "invalid_prompt" in message
 
 
 def _criterion_weight_maps(criteria: dict[str, Any], key: str) -> tuple[dict[str, float], list[float]]:
@@ -152,9 +195,7 @@ def finalize_structured_judgment(data: dict[str, Any], criteria: dict[str, Any])
     prohibited_points, prohibited_max = _weighted_points(prohibited, PROHIBITED_SCORES, prohibited_weight_map, prohibited_positional_weights)
     prohibited_rate = prohibited_points / prohibited_max if prohibited_max else 0.0
     prohibited_compliance = 1.0 - prohibited_rate if prohibited_max else 1.0
-    final_score = 100.0 * ((0.8 * (expected_coverage or 0.0)) + (0.2 * prohibited_compliance))
-    if prohibited_points > 0:
-        final_score = min(final_score, 74.0)
+    final_score = 100.0 * ((EXPECTED_WEIGHT * (expected_coverage or 0.0)) + (PROHIBITED_WEIGHT * prohibited_compliance))
 
     return {
         "expected": expected,

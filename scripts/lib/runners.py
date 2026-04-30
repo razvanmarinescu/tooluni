@@ -85,6 +85,7 @@ def default_model_specs() -> list[ModelSpec]:
     return [
         ModelSpec(provider="openai", model_name="gpt-5.4", display_name="gpt-5.4"),
         ModelSpec(provider="anthropic", model_name="claude-haiku-4-5", display_name="claude-haiku-4.5"),
+        ModelSpec(provider="anthropic", model_name="claude-opus-4-7", display_name="claude-opus-4.7"),
         ModelSpec(provider="anthropic", model_name="claude-opus-4-6", display_name="claude-opus-4.6"),
         ModelSpec(provider="anthropic", model_name="claude-sonnet-4-6", display_name="claude-sonnet-4.6"),
     ]
