@@ -58,7 +58,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Prepare one evaluation item for the ToolUniverse Router agent."
     )
-    parser.add_argument("--index", type=int, help="1-based submission index in 48-submissions-clean.json")
+    parser.add_argument("--index", type=int, help="1-based submission index in 47-submissions-clean.json")
     parser.add_argument("--id", dest="item_id", help="Submission UUID")
     parser.add_argument(
         "--include-existing",

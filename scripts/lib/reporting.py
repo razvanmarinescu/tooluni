@@ -17,7 +17,13 @@ def _recompute_final_score(scores: dict[str, Any]) -> None:
 
     Safe to call repeatedly and on rows from older runs: the previously stored
     final_score is simply overwritten from the components we already have.
+
+    Skipped when ``scores["_score_method"] != "ours"`` so an upstream caller
+    (e.g. regenerate_summary's --score-method=diego path) can pre-compute a
+    different final_score and signal that it should be preserved verbatim.
     """
+    if scores.get("_score_method") and scores.get("_score_method") != "ours":
+        return
     expected_coverage = scores.get("expected_coverage")
     prohibited_rate = scores.get("prohibited_rate")
     if not isinstance(expected_coverage, (int, float)):
@@ -378,110 +384,11 @@ def write_summary_markdown(path: Path, judgments: list[dict[str, Any]], response
                     )
                 )
 
-        if summary_style == "weighted_positive":
-            lines.extend(
-                [
-                    "",
-                    "## Formulas",
-                    "",
-                    "Benchling weighted-rubric strategy:",
-                    "Each question provides only positive rubric criteria with raw weights. The harness normalizes those weights within the question so the weighted rubric score is always on a 0 to 1 scale.",
-                    "",
-                    "Per-criterion score:",
-                    "$$",
-                    "s(c) = \\begin{cases}",
-                    "1.0 & \\text{if met} \\\\",
-                    "0.5 & \\text{if partial} \\\\",
-                    "0.0 & \\text{if missed} \\\\",
-                    "0.25 & \\text{if unclear}",
-                    "\\end{cases}",
-                    "$$",
-                    "",
-                    "Weight normalization:",
-                    "$$",
-                    "w(c) = \\frac{w_{raw}(c)}{\\sum_{c' \\in C} w_{raw}(c')}",
-                    "$$",
-                    "$$",
-                    "\\sum_{c \\in C} w(c) = 1",
-                    "$$",
-                    "",
-                    "Item-level rubric score:",
-                    "$$",
-                    "R = \\sum_{c \\in C} w(c) \\cdot s(c)",
-                    "$$",
-                    "$$",
-                    "\\text{rubric score} = R",
-                    "$$",
-                    "",
-                    "Final score:",
-                    "$$",
-                    "\\text{final score} = 100 \\cdot R",
-                    "$$",
-                    "No prohibited-criteria adjustment or cap is applied for this rubric style.",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    "",
-                    "## Formulas",
-                    "",
-                    "Per-criterion expected-item score:",
-                    "$$",
-                    "s_{expected}(c) = \\begin{cases}",
-                    "1.0 & \\text{if met} \\\\",
-                    "0.5 & \\text{if partial} \\\\",
-                    "0.0 & \\text{if missed} \\\\",
-                    "0.25 & \\text{if unclear}",
-                    "\\end{cases}",
-                    "$$",
-                    "",
-                    "Per-criterion prohibited-item score:",
-                    "$$",
-                    "s_{prohibited}(c) = \\begin{cases}",
-                    "0.0 & \\text{if not violated} \\\\",
-                    "1.0 & \\text{if violated} \\\\",
-                    "0.5 & \\text{if unclear}",
-                    "\\end{cases}",
-                    "$$",
-                    "",
-                    "Item-level aggregates:",
-                    "$$",
-                    "w(c) = \\frac{w_{raw}(c)}{\\sum_{c' \\in C_{section}} w_{raw}(c')}",
-                    "$$",
-                    "$$",
-                    "E = \\sum_{c \\in C_{expected}} w(c) \\cdot s_{expected}(c)",
-                    "$$",
-                    "$$",
-                    "\\sum_{c \\in C_{expected}} w(c) = 1",
-                    "$$",
-                    "$$",
-                    "\\text{expected coverage} = E",
-                    "$$",
-                    "$$",
-                    "P = \\sum_{c \\in C_{prohibited}} w(c) \\cdot s_{prohibited}(c)",
-                    "$$",
-                    "$$",
-                    "\\sum_{c \\in C_{prohibited}} w(c) = 1",
-                    "$$",
-                    "$$",
-                    "\\text{prohibited rate} = P",
-                    "$$",
-                    "$$",
-                    "\\text{if } C_{prohibited} = \\varnothing, \\text{ then prohibited rate} = 0",
-                    "$$",
-                    "$$",
-                    "\\text{prohibited compliance} = 1 - \\text{prohibited rate}",
-                    "$$",
-                    "",
-                    "Final score:",
-                    "$$",
-                    f"\\text{{final score}} = 100 \\cdot \\left({EXPECTED_WEIGHT:.1f} \\cdot \\text{{expected coverage}} + {PROHIBITED_WEIGHT:.1f} \\cdot \\text{{prohibited compliance}}\\right)",
-                    "$$",
-                    f"Weights: expected coverage ({EXPECTED_WEIGHT:.1f}) / prohibited compliance ({PROHIBITED_WEIGHT:.1f}). "
-                    "No score cap is applied — prohibited violations are expressed entirely through the weight.",
-                ]
-            )
+        # Per-criterion score formulas and aggregation rules are documented in
+        # the source (scripts/lib/judge.py: EXPECTED_SCORES / PROHIBITED_SCORES;
+        # scripts/lib/reporting.py: EXPECTED_WEIGHT / PROHIBITED_WEIGHT). They
+        # were intentionally removed from summary.md to keep the report focused
+        # on the numbers.
 
         run_answer_input_tokens = 0.0
         run_answer_output_tokens = 0.0

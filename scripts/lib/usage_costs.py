@@ -39,6 +39,8 @@ PRICING_BY_MODEL: dict[str, Pricing] = {
     "claude-haiku-3": Pricing(0.25, 1.25, cache_write_5m_per_million=0.30, cache_write_1h_per_million=0.50, cache_hit_per_million=0.03),
     "gpt-5.4": Pricing(2.50, 15.0, cached_input_per_million=0.25),
     "gpt-5-4": Pricing(2.50, 15.0, cached_input_per_million=0.25),
+    "gpt-5.5": Pricing(2.50, 15.0, cached_input_per_million=0.25),
+    "gpt-5-5": Pricing(2.50, 15.0, cached_input_per_million=0.25),
     "gpt-5.4-mini": Pricing(0.75, 4.50, cached_input_per_million=0.075),
     "gpt-5.4 mini": Pricing(0.75, 4.50, cached_input_per_million=0.075),
     "gpt-5-4-mini": Pricing(0.75, 4.50, cached_input_per_million=0.075),

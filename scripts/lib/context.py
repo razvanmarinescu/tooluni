@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,13 @@ try:
     from ddgs import DDGS
 except ImportError:  # pragma: no cover - fallback for older environments
     from duckduckgo_search import DDGS
+
+
+# DDGS holds non-thread-safe state in its HTTP client / cookie jar; concurrent
+# DDGS() sessions from different worker threads deadlock indefinitely. A
+# module-level lock serializes the call. Each invocation only takes 1–3s, so
+# the throughput cost is negligible compared to the LLM call that follows it.
+_DDGS_LOCK = threading.Lock()
 
 
 STOPWORDS = {
@@ -100,8 +108,9 @@ def _compact_query(query: str, max_terms: int = 18) -> str:
 def web_search_context(query: str, max_results: int = 5) -> dict[str, Any]:
     search_query = _compact_query(query)
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(search_query, max_results=max_results))
+        with _DDGS_LOCK:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(search_query, max_results=max_results))
     except Exception as exc:  # pragma: no cover - network errors are environment-specific
         return {"query": search_query, "results": [], "error": str(exc)}
 
@@ -172,12 +181,96 @@ def render_pretty_web_trace(trace: list[dict[str, Any]]) -> str:
                 lines.append(f"     URL: {href}")
             if body:
                 lines.append(f"     Snippet: {body}")
-        injected_text = event.get("injected_text") or ""
-        if injected_text:
-            lines.append("  Injected text:")
-            for line in injected_text.splitlines():
-                lines.append(f"    {line}")
     return "\n".join(lines)
+
+
+def render_markdown_web_trace(
+    *,
+    question: str,
+    dataset_index: int,
+    submission_id: str,
+    model_name: str,
+    trace: list[dict[str, Any]],
+    raw_response: dict[str, Any] | None,
+    final_response_text: str | None,
+) -> str:
+    """Per-question markdown for the ``web_tools`` tier: DDGS query and
+    results that were injected into the prompt, then the model's final
+    output (and thinking blocks, when present)."""
+    out: list[str] = []
+    out.append(f"# q{dataset_index:02d} — {model_name} (web_tools)")
+    out.append("")
+    out.append(f"_submission: `{submission_id}`_")
+    out.append("")
+    out.append("## Question")
+    out.append("")
+    out.append(question.strip())
+    out.append("")
+
+    for event in trace or []:
+        out.append(f"## Web search (step {event.get('step', '?')})")
+        out.append("")
+        q = event.get("query")
+        if q:
+            out.append(f"**Query:** `{q}`")
+            out.append("")
+        if event.get("error"):
+            out.append(f"**Error:** {event['error']}")
+            out.append("")
+        results = event.get("raw_results") or []
+        out.append(f"**Result count:** {len(results)}")
+        out.append("")
+        for index, result in enumerate(results, start=1):
+            title = result.get("title") or "(no title)"
+            href = result.get("href") or ""
+            body = (result.get("body") or "").strip()
+            if href:
+                out.append(f"{index}. [{title}]({href})")
+            else:
+                out.append(f"{index}. {title}")
+            if body:
+                snippet = body if len(body) <= 600 else body[:600].rstrip() + "…"
+                out.append(f"   > {snippet}")
+        out.append("")
+
+    # Pull thinking + text from the final model response, if available.
+    if raw_response is not None:
+        final = raw_response.get("final") if isinstance(raw_response, dict) else None
+        if isinstance(final, dict):
+            content = final.get("content") or final.get("output") or []
+            thinking_pieces: list[str] = []
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "thinking":
+                    txt = (block.get("thinking") or "").strip()
+                    if txt:
+                        thinking_pieces.append(txt)
+                    elif block.get("signature"):
+                        thinking_pieces.append(
+                            "_(adaptive thinking occurred; content not exposed by API)_"
+                        )
+                elif btype == "redacted_thinking":
+                    thinking_pieces.append("_(redacted thinking block)_")
+                elif btype == "reasoning":
+                    summary = block.get("summary") or block.get("text") or ""
+                    if summary:
+                        thinking_pieces.append(str(summary))
+            if thinking_pieces:
+                out.append("## Thinking")
+                out.append("")
+                for piece in thinking_pieces:
+                    out.append("> " + piece.replace("\n", "\n> "))
+                    out.append("")
+
+    if final_response_text:
+        out.append("## Final answer")
+        out.append("")
+        out.append(final_response_text.strip())
+        out.append("")
+
+    return "\n".join(out)
 
 
 def _normalize_tool_results(data: Any) -> list[dict[str, Any]]:

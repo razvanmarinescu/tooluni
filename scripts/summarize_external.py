@@ -5,7 +5,7 @@ Biomni and Potato judgment runs.
 Reads:
   runs/biomni/judgments.jsonl
   runs/potato/judgments.jsonl
-  genetic_benchmark_v1/48-submissions-clean.json  (for question previews)
+  genetic_benchmark_v1/47-submissions-clean.json  (for question previews)
 
 Writes:
   runs/external_summary.md
@@ -23,10 +23,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from lib.dataset import load_items  # noqa: E402
-from lib.reporting import load_jsonl  # noqa: E402
+from lib.judge import EXPECTED_WEIGHT, PROHIBITED_WEIGHT  # noqa: E402
+from lib.reporting import _recompute_final_score, load_jsonl  # noqa: E402
 
 
-DATASET = PROJECT_ROOT / "genetic_benchmark_v1" / "48-submissions-clean.json"
+DATASET = PROJECT_ROOT / "genetic_benchmark_v1" / "47-submissions-clean.json"
 BIOMNI_JUDGMENTS = PROJECT_ROOT / "runs" / "biomni" / "judgments.jsonl"
 POTATO_JUDGMENTS = PROJECT_ROOT / "runs" / "potato" / "judgments.jsonl"
 OUTPUT_MD = PROJECT_ROOT / "runs" / "external_summary.md"
@@ -34,7 +35,14 @@ OUTPUT_MD = PROJECT_ROOT / "runs" / "external_summary.md"
 
 def _scores(row: dict[str, Any]) -> dict[str, Any]:
     judgment = row.get("judgment") or {}
-    return judgment.get("scores", {}) if isinstance(judgment, dict) else {}
+    if not isinstance(judgment, dict):
+        return {}
+    scores = judgment.get("scores", {})
+    if isinstance(scores, dict):
+        # Recompute final_score with the currently-configured weights so this
+        # summary stays consistent with runs/{biomni,potato}/summary.md.
+        _recompute_final_score(scores)
+    return scores
 
 
 def _numeric(value: Any) -> float | None:
@@ -66,12 +74,13 @@ def per_question_means(rows: list[dict[str, Any]]) -> dict[int, dict[str, float 
 
 
 def aggregate(rows: list[dict[str, Any]]) -> dict[str, float | None]:
-    finals = [_numeric(_scores(r).get("final_score")) for r in rows]
-    finals = [v for v in finals if v is not None]
-    coverages = [_numeric(_scores(r).get("expected_coverage")) for r in rows]
-    coverages = [v for v in coverages if v is not None]
-    prohibs = [_numeric(_scores(r).get("prohibited_rate")) for r in rows]
-    prohibs = [v for v in prohibs if v is not None]
+    # Macro-average across questions, matching write_summary_markdown in
+    # lib/reporting.py. When every question has 1 run this is equivalent to
+    # the plain mean.
+    per_q = per_question_means(rows)
+    finals = [v["final_score"] for v in per_q.values() if isinstance(v["final_score"], (int, float))]
+    coverages = [v["expected_coverage"] for v in per_q.values() if isinstance(v["expected_coverage"], (int, float))]
+    prohibs = [v["prohibited_rate"] for v in per_q.values() if isinstance(v["prohibited_rate"], (int, float))]
     return {
         "n_runs": len(rows),
         "n_questions": len({r.get("dataset_index") for r in rows if isinstance(r.get("dataset_index"), int)}),
@@ -101,7 +110,7 @@ def main() -> None:
     lines.append("# External evaluation: Biomni vs Potato")
     lines.append("")
     lines.append("Judge: gpt-5.4 (pinned, see `scripts/judge_eval.py`).")
-    lines.append("Rubric: legacy structured (expected + prohibited criteria from `48-submissions-clean.json`).")
+    lines.append("Rubric: legacy structured (expected + prohibited criteria from `47-submissions-clean.json`).")
     lines.append("")
     lines.append("## Aggregate")
     lines.append("")
@@ -118,8 +127,10 @@ def main() -> None:
         f"{fmt(potato_agg['prohibited_rate'], 3)} |"
     )
     lines.append("")
-    lines.append("`final_score = 100 * (0.8 * expected_coverage + 0.2 * (1 - prohibited_rate))`, "
-                 "with a cap of 74.0 when any prohibited item is violated.")
+    lines.append(
+        f"`final_score = 100 * ({EXPECTED_WEIGHT} * expected_coverage + "
+        f"{PROHIBITED_WEIGHT} * (1 - prohibited_rate))`. No score cap."
+    )
     lines.append("")
 
     # --- Per-question side-by-side ---

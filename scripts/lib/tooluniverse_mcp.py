@@ -304,3 +304,167 @@ def render_pretty_tool_trace(trace_events: list[dict[str, Any]]) -> str:
         for line in rendered_lines[1:]:
             lines.append(f"    {line}")
     return "\n".join(lines)
+
+
+_RESULT_TRUNCATE = 1500  # chars per tool result in the markdown
+
+
+def _truncate(text: str, limit: int = _RESULT_TRUNCATE) -> str:
+    if text is None:
+        return ""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f"\n… [truncated, {len(text) - limit} more chars]"
+
+
+def render_markdown_tool_trace(
+    *,
+    question: str,
+    dataset_index: int,
+    submission_id: str,
+    model_name: str,
+    tier: str,
+    raw_turns: list[dict[str, Any]],
+    trace_events: list[dict[str, Any]],
+    final_response_text: str | None = None,
+) -> str:
+    """Build a per-question markdown trace that interleaves the model's
+    thinking/text blocks with the actual tool calls and their results.
+
+    Anthropic content-block types handled: ``thinking`` (extended-thinking
+    blocks), ``text`` (visible model text), ``tool_use`` (model tool calls).
+    OpenAI ``responses.create`` shapes the same trace into ``message`` /
+    ``function_call`` items; both are routed through the same logic.
+    """
+    out: list[str] = []
+    out.append(f"# q{dataset_index:02d} — {model_name} ({tier})")
+    out.append("")
+    out.append(f"_submission: `{submission_id}`_")
+    out.append("")
+    out.append("## Question")
+    out.append("")
+    out.append(question.strip())
+    out.append("")
+
+    # Walk turns in order and consume trace_events as tool_use blocks appear.
+    # Both Anthropic (`content` list with type-tagged blocks) and OpenAI
+    # (`output` list with item-tagged entries) are supported.
+    trace_iter = iter(trace_events)
+
+    def _next_event() -> dict[str, Any] | None:
+        return next(trace_iter, None)
+
+    for turn_idx, turn in enumerate(raw_turns, start=1):
+        blocks = turn.get("content") or turn.get("output") or []
+        if not blocks:
+            continue
+        out.append(f"## Turn {turn_idx}")
+        out.append("")
+        for block in blocks:
+            btype = block.get("type")
+            if btype == "thinking":
+                thinking_text = (block.get("thinking") or "").strip()
+                if thinking_text:
+                    out.append("**Thinking:**")
+                    out.append("")
+                    out.append("> " + thinking_text.replace("\n", "\n> "))
+                    out.append("")
+                elif block.get("signature"):
+                    # Adaptive thinking returns a signature-only block — content
+                    # is intentionally not exposed by the API.
+                    out.append("**Thinking:** _(adaptive thinking occurred; content not exposed by API)_")
+                    out.append("")
+            elif btype == "redacted_thinking":
+                out.append("**Thinking:** _(redacted)_")
+                out.append("")
+            elif btype == "text":
+                text = (block.get("text") or "").strip()
+                if text:
+                    out.append("**Model:**")
+                    out.append("")
+                    out.append(text)
+                    out.append("")
+            elif btype == "tool_use":
+                event = _next_event()
+                if event is None:
+                    out.append(
+                        f"**Tool call:** `{block.get('name')}` — _(no matching trace event)_"
+                    )
+                    out.append("")
+                    continue
+                _emit_tool_event(out, event)
+            elif btype == "function_call":  # OpenAI shape
+                event = _next_event()
+                if event is None:
+                    out.append(
+                        f"**Tool call:** `{block.get('name')}` — _(no matching trace event)_"
+                    )
+                    out.append("")
+                    continue
+                _emit_tool_event(out, event)
+            elif btype == "message":  # OpenAI text wrapper
+                # Each message contains content[] of {"type":"output_text","text":"..."}
+                msg_content = block.get("content") or []
+                pieces: list[str] = []
+                for item in msg_content:
+                    if isinstance(item, dict) and item.get("type") == "output_text":
+                        pieces.append(item.get("text") or "")
+                msg_text = "".join(pieces).strip()
+                if msg_text:
+                    out.append("**Model:**")
+                    out.append("")
+                    out.append(msg_text)
+                    out.append("")
+            elif btype == "reasoning":  # OpenAI reasoning summary (if present)
+                summary = block.get("summary") or block.get("text") or ""
+                if summary:
+                    out.append("**Thinking:**")
+                    out.append("")
+                    out.append("> " + str(summary).replace("\n", "\n> "))
+                    out.append("")
+
+    # Any trailing trace events (shouldn't normally happen)
+    leftover = list(trace_iter)
+    if leftover:
+        out.append("## Unmatched trailing tool events")
+        out.append("")
+        for event in leftover:
+            _emit_tool_event(out, event)
+
+    if final_response_text:
+        out.append("## Final answer")
+        out.append("")
+        out.append(final_response_text.strip())
+        out.append("")
+
+    return "\n".join(out)
+
+
+def _emit_tool_event(out: list[str], event: dict[str, Any]) -> None:
+    name = event.get("display_name") or event.get("model_tool_name") or event.get("mcp_tool_name") or "(tool)"
+    step = event.get("step")
+    ok = event.get("ok")
+    badge = "✓" if ok else "✗"
+    header = f"**Tool call {step}** — `{name}` {badge}"
+    out.append(header)
+    out.append("")
+    args = event.get("arguments")
+    if args is not None:
+        out.append("Arguments:")
+        out.append("")
+        out.append("```json")
+        out.append(_truncate(json.dumps(args, ensure_ascii=True, indent=2), 1200))
+        out.append("```")
+        out.append("")
+    result = event.get("result")
+    if result is not None:
+        if isinstance(result, (dict, list)):
+            rendered = json.dumps(result, ensure_ascii=True, indent=2)
+        else:
+            rendered = str(result)
+        out.append("Result:")
+        out.append("")
+        out.append("```json")
+        out.append(_truncate(rendered))
+        out.append("```")
+        out.append("")

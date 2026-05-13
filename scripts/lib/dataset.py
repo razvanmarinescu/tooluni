@@ -10,7 +10,7 @@ def project_root() -> Path:
 
 
 def default_dataset_path() -> Path:
-    return project_root() / "48-submissions-clean.json"
+    return project_root() / "47-submissions-clean.json"
 
 
 def load_items(dataset_path: Path | None = None) -> list[dict[str, Any]]:

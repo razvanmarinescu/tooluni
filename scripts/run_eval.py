@@ -13,10 +13,12 @@ import threading
 import time
 from typing import Any
 
+from lib.context import render_markdown_web_trace
 from lib.dataset import default_dataset_path, get_question_text, load_items, normalize_criteria, project_root, select_items
-from lib.judge import Judge
+from lib.judge import HarnessJudge, Judge
 from lib.reporting import append_jsonl, load_jsonl, write_summary_csv, write_summary_markdown
 from lib.runners import AnswerRunner, default_model_specs, default_tiers
+from lib.tooluniverse_mcp import render_markdown_tool_trace
 from lib.usage_costs import combine_usage_metrics
 
 
@@ -127,7 +129,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name")
     parser.add_argument("--run-name-suffix", default="", help="Optional suffix for auto-generated run names, e.g. _benchling")
     parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers for model runs.")
-    parser.add_argument("--judge-model", default=FIXED_JUDGE_MODEL, help=f"Ignored. Judge model is pinned to {FIXED_JUDGE_MODEL}.")
+    parser.add_argument("--judge-model", default=FIXED_JUDGE_MODEL, help=f"Ignored when --verifier=single-verifier. Judge model is pinned to {FIXED_JUDGE_MODEL}.")
+    parser.add_argument(
+        "--verifier",
+        choices=["single-verifier", "verifier-harness"],
+        default="single-verifier",
+        help="Which judging strategy to use. 'single-verifier' = one GPT-5.4 judge. "
+        "'verifier-harness' = 4-way majority vote across 2x GPT-5.5 + 2x Sonnet-4.6 (Diego's pattern).",
+    )
     return parser.parse_args()
 
 
@@ -165,6 +174,8 @@ def build_output_paths(root: Path, run_name: str | None, run_name_suffix: str = 
         "judgments": run_dir / "judgments.jsonl",
         "web_traces": run_dir / "web_traces.jsonl",
         "tool_traces": run_dir / "tool_traces.jsonl",
+        "tooluniverse_traces_dir": run_dir / "tooluniverse_traces",
+        "web_traces_dir": run_dir / "web_traces",
         "summary_csv": run_dir / "summary.csv",
         "summary_md": run_dir / "summary.md",
         "meta": run_dir / "meta.json",
@@ -182,13 +193,17 @@ def get_thread_runner(root: Path) -> AnswerRunner:
     return runner
 
 
-def get_thread_judge(root: Path, model_name: str) -> Judge:
+def get_thread_judge(root: Path, model_name: str, verifier: str = "single-verifier"):
     judge = getattr(THREAD_LOCAL, "judge", None)
     judge_model_name = getattr(THREAD_LOCAL, "judge_model_name", None)
-    if judge is None or judge_model_name != model_name:
-        judge = Judge(root, model_name=model_name)
+    cache_key = (verifier, model_name)
+    if judge is None or judge_model_name != cache_key:
+        if verifier == "verifier-harness":
+            judge = HarnessJudge(root)
+        else:
+            judge = Judge(root, model_name=model_name)
         THREAD_LOCAL.judge = judge
-        THREAD_LOCAL.judge_model_name = model_name
+        THREAD_LOCAL.judge_model_name = cache_key
     return judge
 
 
@@ -271,6 +286,14 @@ def build_judgment_row(
             }),
             **combine_usage_metrics("judge", judge_meta.get("usage_metrics")),
             "judge_model_name": judge_meta.get("judge_model_name", args.judge_model),
+            # Optional: only present when the verifier-harness runs. Captures
+            # per-judge timing, retry attempts, and any errors so a future
+            # post-hoc inspection of judgments.jsonl can see what happened.
+            **(
+                {"harness_calls": judge_meta["harness_calls"]}
+                if judge_meta.get("harness_calls")
+                else {}
+            ),
         }
     except Exception as exc:  # pragma: no cover - depends on external APIs
         return {
@@ -297,6 +320,61 @@ def build_judgment_row(
             **combine_usage_metrics("judge", None),
             "judge_model_name": args.judge_model,
         }
+
+
+def _markdown_filename(dataset_index: int) -> str:
+    return f"q{int(dataset_index):02d}.md"
+
+
+def _write_tool_trace_markdown(
+    *,
+    paths: dict[str, Path],
+    base_row: dict[str, Any],
+    job: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    raw_response = result.get("raw_response") or {}
+    raw_turns = raw_response.get("turns") if isinstance(raw_response, dict) else None
+    trace_events = result.get("tool_trace") or []
+    if not raw_turns and not trace_events:
+        return
+    md = render_markdown_tool_trace(
+        question=job["question"],
+        dataset_index=base_row["dataset_index"],
+        submission_id=base_row.get("submission_id") or "",
+        model_name=base_row.get("model_name") or "?",
+        tier=base_row.get("tier") or "?",
+        raw_turns=raw_turns or [],
+        trace_events=trace_events,
+        final_response_text=result.get("response_text"),
+    )
+    out_dir = paths["tooluniverse_traces_dir"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / _markdown_filename(base_row["dataset_index"])).write_text(md, encoding="utf-8")
+
+
+def _write_web_trace_markdown(
+    *,
+    paths: dict[str, Path],
+    base_row: dict[str, Any],
+    job: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    web_trace = result.get("web_trace") or []
+    if not web_trace:
+        return
+    md = render_markdown_web_trace(
+        question=job["question"],
+        dataset_index=base_row["dataset_index"],
+        submission_id=base_row.get("submission_id") or "",
+        model_name=base_row.get("model_name") or "?",
+        trace=web_trace,
+        raw_response=result.get("raw_response"),
+        final_response_text=result.get("response_text"),
+    )
+    out_dir = paths["web_traces_dir"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / _markdown_filename(base_row["dataset_index"])).write_text(md, encoding="utf-8")
 
 
 def process_job(
@@ -344,6 +422,12 @@ def process_job(
                     "web_trace": result.get("web_trace"),
                     "pretty_trace": result.get("raw_response", {}).get("pretty_web_trace", ""),
                 }
+                _write_web_trace_markdown(
+                    paths=paths,
+                    base_row=base_row,
+                    job=job,
+                    result=result,
+                )
             tool_trace_row = None
             if result.get("tool_trace"):
                 tool_trace_row = {
@@ -352,6 +436,12 @@ def process_job(
                     "tool_trace": result.get("tool_trace"),
                     "pretty_trace": result.get("raw_response", {}).get("pretty_tool_trace", ""),
                 }
+                _write_tool_trace_markdown(
+                    paths=paths,
+                    base_row=base_row,
+                    job=job,
+                    result=result,
+                )
         else:
             web_trace_row = None
             tool_trace_row = None
@@ -366,7 +456,7 @@ def process_job(
                 tier=job["tier"],
                 stage="judging",
             )
-            judge = get_thread_judge(root, args.judge_model)
+            judge = get_thread_judge(root, args.judge_model, verifier=getattr(args, "verifier", "single-verifier"))
             judgment_row = build_judgment_row(
                 base_row=base_row,
                 question=job["question"],
@@ -483,6 +573,7 @@ def main() -> None:
                 "tiers": tiers,
                 "workers": args.workers,
                 "judge_model": args.judge_model,
+                "verifier": getattr(args, "verifier", "single-verifier"),
                 "run_started_at": run_started_at.isoformat(),
             },
             indent=2,

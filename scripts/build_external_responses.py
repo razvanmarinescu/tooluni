@@ -5,7 +5,7 @@
 Biomni layout: data/Biomi/biomni_outputs/p-NN/{prompt.txt, answer.txt}
 Potato layout: data/Potato_Artifacts_Gene_Editing_Mar 26 2026/query_NNN_<slug>/run_N/final_report.md
 
-Responses are matched to entries in genetic_benchmark_v1/48-submissions-clean.json
+Responses are matched to entries in genetic_benchmark_v1/47-submissions-clean.json
 by prompt text (biomni) or by slug prefix of the question prompt (potato).
 """
 from __future__ import annotations
@@ -23,7 +23,7 @@ from lib.dataset import load_items, normalize_criteria  # noqa: E402
 from lib.reporting import append_jsonl  # noqa: E402
 
 
-DATASET = PROJECT_ROOT / "genetic_benchmark_v1" / "48-submissions-clean.json"
+DATASET = PROJECT_ROOT / "genetic_benchmark_v1" / "47-submissions-clean.json"
 BIOMNI_DIR = PROJECT_ROOT / "data" / "Biomi" / "biomni_outputs"
 POTATO_DIR = PROJECT_ROOT / "data" / "Potato_Artifacts_Gene_Editing_Mar 26 2026"
 RUNS_DIR = PROJECT_ROOT / "runs"
